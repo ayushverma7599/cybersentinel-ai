@@ -1,264 +1,300 @@
-Here's a complete description of every command in your file:
+# CyberSentinel AI — End-to-End Command Reference
+
+The current, verified pipeline. Every command uses the correct files
+(`features_all.json`, not the stale `features.json`) and the current scripts.
+
+**Verified reference run:** 155 sessions → 17 MITRE techniques → 40
+compromise-stage → 17 findings; real packet capture 154/155 (99.4%); combined
+set 46,083 flows. Benchmark (3-seed mean): LR F1 0.784 / LSTM F1 0.779, LSTM
+FPR 0.128 vs 0.214, and **lead-time ~24 flows earlier**. Generalization: 2
+pass / 2 borderline / 2 fail. Numbers vary slightly with seed/dataset — the
+scripts print mean ± std so you cite a range, not one figure.
+
+Run everything from `~/honeypot` — every script uses relative paths.
 
 ---
 
-## CyberSentinel AI — Command Reference Guide
-
----
-
-### **Setup & Infrastructure**
+## Part 1 — Infrastructure & Attack Capture
 
 ```bash
 cd ~/honeypot
+docker-compose up -d && sleep 15
+docker-compose restart cowrie && sleep 10
+chmod +x attack1.sh build_real_features.sh
 ```
-Navigate to your project directory. All commands must be run from here — scripts use relative paths to find `cowrie-raw.json`, `ttp_records.json`, `features.json`, etc.
-
----
+Starts Cowrie + payload + Elasticsearch + Kibana, then restarts Cowrie so its
+log holds exactly this run (its log is append-only — a fresh log is what makes
+the real-packet match come out clean in Part 4).
 
 ```bash
-docker-compose up -d
+./attack1.sh
 ```
-Start the entire honeypot stack in detached (background) mode. Spins up 3 containers simultaneously:
-- `honeypot-cowrie-1` — the fake SSH server that captures attacker sessions
-- `honeypot-elasticsearch-1` — search database that stores all log events
-- `honeypot-kibana-1` — visual dashboard at `http://10.0.2.15:5601`
+Runs the primary 13-phase / 16-technique attack simulation AND self-captures a
+matching packet trace, copying it to `honeypot_capture.pcap` on success. (The
+simpler `attack.sh` — 4 phases, no built-in capture — still works if you prefer
+it, but then you must capture manually; see Part 4 Step 2.)
 
-The `-d` flag means it runs in the background so your terminal stays free.
+The Cowrie log is pulled for you by `build_real_features.sh` (Part 4) and by
+`run_pipeline.sh` (Part 2), so you don't normally `docker cp` by hand. To do it
+manually: `docker cp honeypot-cowrie-1:/cowrie/cowrie-git/var/log/cowrie/cowrie.json ~/honeypot/cowrie-raw.json`.
 
 ---
 
-```bash
-sleep 15
-```
-Wait 15 seconds for all containers to fully initialize before sending any traffic. Cowrie needs time to bind to port 2222 and Elasticsearch needs time to start its indexing service. Running `attack.sh` before this causes connection refused errors.
-
----
-
-### **Attack Simulation**
-
-```bash
-./attack.sh
-```
-Runs a realistic multi-phase attack simulation against the Cowrie honeypot. Executes three phases in sequence:
-- **Phase 1 (Reconnaissance):** SSH login attempts with `whoami`, `id`, `uname -a`, `cat /etc/passwd` — triggers T1082 and T1087
-- **Phase 2 (Tool Transfer):** Downloads a fake payload using `wget` — triggers T1105
-- **Phase 3 (Execution):** Runs `chmod +x` and executes the payload — triggers T1204
-
-All commands are recorded by Cowrie as if a real attacker typed them. This is what populates your `cowrie.json` log file.
-
----
-
-```bash
-sleep 5
-```
-Brief pause after `attack.sh` completes to let Cowrie finish writing all session events to disk before you copy the log file out. Without this, the last few events may be missing from the JSON.
-
----
-
-### **Log Extraction**
-
-```bash
-docker cp honeypot-cowrie-1:/cowrie/cowrie-git/var/log/cowrie/cowrie.json \
-    ~/honeypot/cowrie-raw.json
-```
-Copies the Cowrie log file from **inside the Docker container** to your host machine. This is the critical step that was bugged early in the project — the host-mounted volume stays empty due to a path mismatch, so you must always use `docker cp` to get the real logs. The output file `cowrie-raw.json` contains one JSON event per line (JSONL format) covering connects, login attempts, commands, and file downloads.
-
----
-
-```bash
-wc -l ~/honeypot/cowrie-raw.json
-```
-Count the number of log lines in the raw Cowrie file. Each line is one event. A healthy simulation should produce 500–4000 lines depending on how many sessions `attack.sh` creates. If this returns 0 or a very small number, the `docker cp` failed or Cowrie hasn't written yet.
-
----
-
-```bash
-cat ~/honeypot/cowrie-raw.json | python3 -c "
-import json, sys
-from collections import Counter
-events = Counter()
-for line in sys.stdin:
-    line = line.strip()
-    if line:
-        try:
-            log = json.loads(line)
-            events[log.get('eventid','unknown')] += 1
-        except: pass
-for e,c in events.most_common():
-    print(f'{c:4d}  {e}')
-"
-```
-Quick sanity check — counts how many of each event type are in the log. Output looks like:
-```
- 118  cowrie.command.input
-  96  cowrie.client.var
-  50  cowrie.session.connect
-  48  cowrie.login.success
-```
-If `cowrie.command.input` count is 0, your attack simulation didn't produce command events. If `cowrie.session.connect` is 0, Cowrie wasn't running when `attack.sh` ran.
-
----
-
-### **Core Pipeline**
+## Part 2 — Core TTP Pipeline (MITRE classification + 3-agent scanner)
 
 ```bash
 ./run_pipeline.sh
 ```
-Runs the **complete CyberSentinel AI pipeline** in one command. Executes three steps sequentially:
-
-**Step 1** — `docker cp` to pull fresh Cowrie logs into `cowrie-raw.json`
-
-**Step 2** — `python3 ttp_extract.py` to parse sessions, classify them against MITRE ATT&CK, and write `ttp_records.json`. Outputs:
-```
-Total sessions found: 350
-Sessions matching at least one technique: 350
-T1110 — Brute Force: 210 sessions
-T1082 — System Information Discovery: 70 sessions
-```
-
-**Step 3** — `python3 cybersentinel_skeleton.py` to run the 3-agent parallel scanner:
-- Recon agent maps endpoints
-- CVE-match agent queries NVD for real CVEs
-- Logic/config agent identifies misconfigurations
-- Orchestrator deduplicates and scores findings
-- Outputs `cybersentinel_report.json` with ranked security findings
-
----
+Three steps in one command: re-pulls `cowrie-raw.json`, runs
+`ttp_extract.py` to classify sessions against MITRE ATT&CK into
+`ttp_records.json`, then runs `cybersentinel_skeleton.py`'s 3-agent scanner
+(Recon / CVE-match / Config, all via the local Ollama Mistral 7B) to produce
+`cybersentinel_report.json`.
 
 ```bash
 python3 parse_cowrie_logs.py
 ```
-Parses `cowrie-raw.json` and ships all events to Elasticsearch for indexing. After this runs you can open Kibana at `http://10.0.2.15:5601` and search/visualize attack data. Creates an index named `cowrie-YYYY.MM.DD`. Also prints top attacking IPs, usernames tried, and passwords attempted.
-
----
-
-### **LSTM Attack Progression Model**
-
-```bash
-python3 lstm_model.py --train
-```
-Trains the PyTorch LSTM sequence model on your `ttp_records.json` sessions. The model learns: given the first N MITRE techniques observed in a session, predict what technique comes next. Key details:
-- Loads 20 real sessions + 63 targeted synthetic sequences
-- Builds vocabulary of your 4–5 unique techniques
-- Trains for 200 epochs with cosine LR schedule
-- Saves best weights to `cybersentinel_lstm.pt`
-
-Must be re-run whenever `ttp_records.json` changes (new sessions captured, new techniques detected). Output shows loss, test accuracy, and LR at each epoch.
-
----
-
-```bash
-python3 lstm_model.py --eval
-```
-Evaluates the trained LSTM on all sessions and prints:
-- Overall accuracy vs random baseline (2.9× lift over 25% random)
-- Per-technique accuracy breakdown with bar charts
-- Confusion matrix showing which techniques the model confuses
-- Infiltration probability calibration — compromise-stage sessions should score 45%+ higher than non-compromise sessions
-
----
+Indexes every event into Elasticsearch. Browse at `http://10.0.2.15:5601`
+(Discover → index `cowrie-*`) once this finishes.
 
 ```bash
 python3 analyze.py
 ```
-IOC (Indicator of Compromise) analysis script. Reads `cowrie-raw.json`, counts top attacking IPs, most-tried usernames and passwords, and most-executed commands. Also indexes 570 events into Elasticsearch. Use this to understand attacker behaviour patterns independently of MITRE classification.
+Independent IOC analysis — top attacking IPs, usernames, passwords, and
+commands — separate from the MITRE classification above.
 
 ---
+
+## Part 3 — LSTM Technique-Sequence Model, Forecasting, Explainability
+
+This is the *separate* model from the flow-level World Model in Part 4 — it
+operates on MITRE technique-ID sequences from `ttp_records.json`, not network
+flow features.
 
 ```bash
-python3 shap_explain.py --all --save
+python3 lstm_model.py --train
+python3 lstm_model.py --eval
 ```
-Runs SHAP-style explainability on every session in `ttp_records.json`. For each session:
-- Uses LSTM attention weights to identify which techniques drove the prediction
-- Uses gradient saliency as a second independent method
-- Outputs top driver, infiltration probability, risk label
-Saves results to `shap_all_sessions.json`. The `--save` flag writes the full explanation JSON. Prints top 5 highest-risk sessions in a table.
-
----
+Trains the technique-sequence LSTM on your captured sessions plus synthetic
+sequences, then evaluates it (accuracy vs. random baseline, confusion matrix,
+infiltration-probability calibration). Re-run `--train` whenever
+`ttp_records.json` changes.
 
 ```bash
 python3 lstm_model.py --forecast T1082 T1087 --k 3
 ```
-K-step forward simulation starting from an observed sequence of T1082 → T1087. The LSTM rolls forward 3 steps, predicting:
-- Step 1: most likely next technique (T1105 — Ingress Tool Transfer, 85% confidence)
-- Step 2: technique after that (T1204 — User Execution, 90% confidence)
-- Final infiltration probability: 98.8% CRITICAL
-
-Change the sequence or `--k` value to simulate different attack starting points.
-
----
-
-### **Real Packet Capture (Scapy)**
+K-step forward simulation from an observed technique sequence. Example real
+output from this session: starting at `T1082 → T1087`, the model forecast
+`T1059 → T1548 → T1489` with a final infiltration probability of **72.8%
+(HIGH)**. Swap in any starting sequence or `--k` value — the forecast is
+stochastic on the trained weights, so exact numbers will vary run to run.
 
 ```bash
-ip addr | grep -B4 '172.18.0.1'
+python3 shap_explain.py --all --save
 ```
-Finds which network interface hosts the Docker bridge network (`172.18.0.1`). The interface name (e.g., `br-43684e179073`) varies between Docker installations and is needed for the Scapy capture command. The `-B4` flag shows 4 lines before the match so you see the interface name.
+Explains every session in `ttp_records.json` using LSTM attention weights +
+gradient saliency, ranks them by risk, and saves `shap_all_sessions.json`
+(155 sessions in the reference run, flagging the highest-risk distinct chains).
 
 ---
+
+## Part 4 — World Model Pipeline (flow-level features, the PS-required part)
+
+This is the section that changed the most. Every step below uses the fixed
+code and produces `features_all.json` — the single dataset that training,
+benchmarking, generalization testing, and the Streamlit demo all read from.
+
+### Step 1 — Honeypot flow features (now circularity-free)
 
 ```bash
-sudo python3 scapy_feature_extractor.py --capture --iface br-43684e179073 --port 2222
+python3 packet_capture.py --cowrie cowrie-raw.json \
+    --out-json features_honeypot_fresh.json --no-norm
 ```
-**Requires root (`sudo`) and a separate terminal.** Starts live packet capture on the Docker bridge interface, filtering for traffic to port 2222 (Cowrie). While this runs in one terminal, start `./attack.sh` in another terminal. When the attack finishes, press `Ctrl+C` here. Saves captured packets to `honeypot_capture.pcap`. Produces real packet-level features:
-- Actual TTL values from IP headers (not hardcoded 64)
-- Real TCP window sizes from SYN packets
-- Genuine retransmission counts from duplicate sequence numbers
-- Port scan signatures from destination port patterns
+Converts Cowrie sessions into 30-dimensional flow feature vectors.
+Previously, several fields (`syn_ratio`, `ack_ratio`, TCP flags,
+`retransmission_count`) were fabricated by bucketing on the same
+login-attempt logic that also set the label — a circularity bug, now fixed.
+Cowrie has zero real packet-layer visibility, so these fields are now
+honestly imputed with fixed constants grounded in real observed data (see
+the `COWRIE_PROXY_*` constants in `packet_capture.py`), tagged
+`packet_features_source: "cowrie_proxy_imputed"` for full auditability.
 
----
+### Step 2 — Real packet capture (optional, but recommended if you can)
 
-### **World Model Pipeline**
+**Use one script — it does the whole aligned chain for you and can't mix runs:**
+```bash
+docker-compose restart cowrie && sleep 10   # fresh log = exactly ONE run in it
+./attack1.sh                                 # attacks AND self-captures the pcap
+./build_real_features.sh                     # pull log → rebuild → extract → merge
+```
+`build_real_features.sh` pulls **this** run's Cowrie log, rebuilds
+`features_honeypot_fresh.json` from it, extracts the packets from
+`honeypot_capture.pcap` (which attack1.sh just wrote for the same run), merges
+them, and prints the real-match count. It writes `features_with_real_packets.json`
+with every row tagged `real_scapy_capture` or
+`cowrie_proxy_imputed`/`unmatched_no_real_capture`, so it's always clear which is which.
+
+**Why the three steps in that order matter — this is what caused every `0/155`.**
+The merge matches a honeypot flow to a captured packet by source port. That only
+works when the Cowrie log and the pcap are from the **same run** — different runs
+use different ephemeral ports and match nothing (the extractor even prints "sample
+ports look completely different"). `packet_capture.py` reads the *real* Cowrie
+`src_port` and scapy reads the *real* wire port, so a same-run pair genuinely lines
+up. The earlier `0/155` runs failed because `features_honeypot_fresh.json` was built
+from an **old** `cowrie-raw.json` while the pcap was a **new** capture. The script
+removes that trap by rebuilding the features from the same log it just pulled. The
+`restart cowrie` matters because Cowrie's log is append-only: without it, an old
+run's sessions linger in the log and dilute the match.
+
+**Do NOT run a separate manual `scapy --capture`** — attack1.sh already captured the
+matching pcap; a separate capture is a different run and matches 0 rows. (If you
+must capture manually for the simpler `attack.sh`, capture → run that same attack →
+then run `build_real_features.sh`, never a capture from one run against a log from
+another.)
+
+You no longer need the old `cp features_honeypot_fresh.json features_with_real_packets.json`
+fallback at all — `merge_cic_data.sh` in Step 3 auto-selects whichever honeypot base
+has the most real-capture rows and prints the count, so it can't be tricked into
+using an all-imputed file. If a real capture genuinely isn't possible, just skip to
+Step 3; the pipeline runs fine on honest imputed constants.
+
+### Step 3 — Full 10-day CIC-IDS-2018 integration
 
 ```bash
-./run_pipeline.sh
+bash merge_cic_data.sh
 ```
-Second run of the main pipeline — after Scapy capture. Re-runs with fresh Cowrie logs to pick up any new sessions from the attack simulation that ran alongside the Scapy capture.
+Downloads (if not already present — this is ~5GB total across all 10 days,
+resumable if interrupted) and merges all 10 CIC-IDS-2018 days — all 6 attack
+categories (Brute Force, DoS, DDoS, Web Attacks, Infiltration, Botnet), not
+just one day — on top of `features_with_real_packets.json`, re-normalizes
+the full combined set fresh, and trains the World Model. Produces the final
+`features_all.json` (46,083 rows in the reference run). This script already
+has the CIC-IDS-2018 "Thuesday" filename typo and the `Infilteration` label
+mapping baked in as fixes — no manual patching needed on a fresh run.
 
----
+### Step 4 — Benchmark (LR baseline vs. LSTM World Model)
 
 ```bash
-./run_world_model_pipeline.sh
+python3 world_model.py --benchmark --features features_all.json --repeat 3
 ```
-Runs the **complete world model pipeline** required by SIH26153. Five steps:
+The direct SIH26153 requirement: trains a fresh Logistic Regression baseline
+and a fresh LSTM World Model on identical features, reports F1 / precision /
+recall / FPR / AUC-ROC for both, and saves `benchmark_results.json`.
 
-**Step 1** — `packet_capture.py --cowrie cowrie-raw.json` converts Cowrie sessions into 30-dimensional network feature vectors (syn_ratio, IAT mean/std/max, TTL, TCP window, payload size, port scan score, etc.)
+Two things changed here and both matter for the report:
 
-**Step 2** — `cic_ids_loader.py --download` downloads Wednesday-14-02-2018 CIC-IDS-2018 CSV (341MB, SSH Brute Force day), converts 101 real T1110 flows, merges with honeypot features → combined dataset of 480 flows
+- **Checkpoint selection is now on a validation split, not the test set.** The
+  LSTM's reported test metrics are taken at the epoch chosen by a held-out
+  validation set carved from training — not the best-ever test epoch. That
+  removes a test-set-peeking bias that used to both inflate the number and
+  make it swing run-to-run.
+- **`--repeat 3` reports the F1 improvement as mean ± std across 3 seeds**, plus
+  the per-seed range. Cite the *range*, not one lucky run — a single LSTM run
+  varies with initialisation at this data size. The benchmark also prints a
+  **lead-time analysis**: how many flows earlier the LSTM raises a correct
+  compromise alert than the static LR baseline (LR can't warn ahead of the
+  attack flow by construction — this is the World Model's real differentiator).
 
-**Step 3** — `world_model.py --train` trains the LSTM World Model on real 30-dimensional network features over 5-flow time windows. Learns P(S_t+1 | S_t) — state transition dynamics. 269,964 parameters, 100 epochs, F1=0.990
+Reference-run result: LR F1 0.784 vs LSTM F1 0.779 (a tie on raw F1), but LSTM
+FPR 0.128 vs 0.214 and **lead-time 25.5 flows vs 1.5 — ~24 flows of early
+warning**. Cite lead-time + FPR + K-step forecasting as the differentiator, not
+the F1 number. Exact figures shift slightly by seed; the script prints the
+range.
 
-**Step 4** — `world_model.py --benchmark` trains Logistic Regression baseline on same features, compares: F1 0.778→0.933 (+15.5%), Precision 0.636→1.000, FPR 0.129→0.000. Saves `benchmark_results.json`
-
-**Step 5** — `world_model.py --predict` runs inference on the 5 most recent flows and prints feature importance with attention weights
-
----
+### Step 5 — Held-out category generalization test
 
 ```bash
-python3 scapy_feature_extractor.py --extract --pcap honeypot_capture.pcap
+python3 generalization_test.py --features features_all.json --repeat 3
 ```
-Parses the saved PCAP file using Scapy's `rdpcap()`. Groups packets into bidirectional flows and extracts real packet-level features: TTL variance across the session, TCP window size from SYN headers, retransmission count from duplicate sequence numbers, payload size distribution, port scan score. Writes `packet_features.json` with 52 real flows from 725 captured packets.
+Holds out each of the 6 CIC-IDS-2018 attack categories *entirely* from
+training (zero rows trained on) and evaluates both models purely on the
+excluded category, one at a time, then prints a consolidated summary table.
+This is what demonstrates the model generalizes to genuinely unseen attack
+types rather than memorizing per-category signatures — stronger evidence
+than the standard chronological-split benchmark above.
 
----
+Same two fixes as the benchmark apply here: checkpoint selection is on a
+validation split (not the held-out category itself), and `--repeat 3` reports
+each category's held-out AUC as **mean ± std across 3 seeds** with a
+three-way verdict — **pass / borderline / FAIL** — instead of a brittle
+single-run yes/no. "Borderline" is the honest label for a category sitting
+right at the 0.6 chance line within its seed spread (that's why some
+categories appeared to "flip" between earlier single-run tests); a stable
+FAIL (Infiltration has been one) is a real weak spot to disclose, not hide.
+Takes a while — a full LSTM training pass per category × 6 categories ×
+`--repeat`, default 40 epochs each. Drop `--repeat` (or set it to 1) for a
+faster single-seed smoke run.
+
+### Step 6 — Live inference / prediction
 
 ```bash
-python3 scapy_feature_extractor.py --merge --features features.json
+python3 world_model.py --predict --features features_all.json
 ```
-Merges real Scapy packet-level features into `features.json`. For the 26 flows that match between the PCAP capture and the Cowrie sessions (matched by source port), overwrites the proxy-estimated TTL/window values with real measured values. The remaining 454 unmatched rows are transparently flagged as `unmatched_no_real_capture` — not silently faked. Outputs `features_with_real_packets.json`.
+Runs inference on the 5 most recent **real honeypot** flows and prints
+attention-weighted feature importance alongside the prediction — the
+"no black-box outputs" requirement for the flow-level model. It now defaults
+to `--predict-source honeypot`, which filters to genuine honeypot rows before
+taking the last 5. This fixes a misleading demo: after a full CIC merge, the
+last rows of `features_all.json` are the last-*merged* CIC day (e.g. an
+Infiltration day), not live honeypot traffic — the old default scored a canned
+CIC row at ~99% and called it "live inference." Pass `--predict-source any` if
+you deliberately want the raw last rows of the file.
 
 ---
 
-### **UI**
+## Part 5 — Verification / audit tools (not part of the required pipeline)
+
+These were built this session to root-cause specific bugs. Keep them —
+they're cheap to re-run and immediately catch a regression if any of the
+raw CIC-IDS-2018 files change or get re-downloaded.
+
+```bash
+python3 audit_cic_labels.py
+```
+Scans every downloaded CIC-IDS-2018 file's `Label` column and flags any
+non-BENIGN label string that doesn't resolve to a MITRE technique under the
+live `CIC_LABEL_TO_MITRE` mapping — this is exactly what caught the
+`Infilteration` typo. Clean run = no silent label-mapping bugs.
+
+```bash
+curl -s http://10.0.2.2:11434/api/tags
+```
+One-line check that the offline Ollama/Mistral service (used by the 3-agent
+scanner in Part 2) is actually reachable before a live demo.
+
+---
+
+## Part 6 — UI
 
 ```bash
 streamlit run streamlit_app.py
+# http://localhost:8501  (or http://10.0.2.15:8501 from the Windows host)
 ```
-Launches the CyberSentinel AI web interface at `http://localhost:8501`. Opens automatically in your browser. Six pages:
-- **Dashboard** — live metrics, technique frequency chart, tactic distribution, kill chain
-- **Session Explorer** — click any session, see kill chain + LSTM prediction + SHAP explanation + infiltration gauge
-- **Attack Predictor** — type any technique sequence, get live LSTM prediction with feature importance bars
-- **K-Step Forecast** — enter starting sequence, see full predicted kill chain with ATT&CK tactic phase labels (Discovery → Command & Control → Execution) and infiltration probability progression chart
-- **World Model** — benchmark comparison chart (LSTM vs LR baseline), live world model inference
-- **Agent Findings** — ranked security report from 3-agent scanner with CVE details and Mistral-generated remediation
+6-page dashboard. The **World Model** page's live-inference section now
+correctly loads `features_all.json` (fixed this session — it used to
+silently default to a stale `features.json`). Requires `world_model.pt`
+(from Part 4, Step 4) and `features_all.json` (from Part 4, Step 3) to both
+exist.
 
-Keep this terminal open — closing it stops the app. Access from Windows host at `http://10.0.2.15:8501`.
+---
+
+## Minimum path — the exact clean end-to-end run
+
+```bash
+cd ~/honeypot
+docker-compose up -d && sleep 15
+docker-compose restart cowrie && sleep 10       # fresh Cowrie log = one clean run
+chmod +x attack1.sh build_real_features.sh
+./attack1.sh                                     # attacks AND self-captures the pcap
+./build_real_features.sh                         # aligned real-packet features (→ 154/155)
+docker cp honeypot-cowrie-1:/cowrie/cowrie-git/var/log/cowrie/cowrie.json cowrie-raw.json
+./run_pipeline.sh
+bash merge_cic_data.sh                            # auto-picks the richest honeypot base
+python3 world_model.py --benchmark --features features_all.json --repeat 3
+python3 generalization_test.py --features features_all.json --repeat 3
+python3 world_model.py --predict --features features_all.json
+streamlit run streamlit_app.py
+```
+
+Fast first pass: drop `--repeat 3` on the benchmark and generalization steps
+(single seed) — much quicker, then add it back for the report's mean ± std.

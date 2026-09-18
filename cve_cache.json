@@ -1,0 +1,293 @@
+{
+  "denial of service SYN flood connection exhaustion Linux": [],
+  "information disclosure system uname Linux": [],
+  "network connection listing netstat": [],
+  "bash shell command injection": [
+    {
+      "id": "CVE-2020-11920",
+      "description": "An issue was discovered in Svakom Siime Eye 14.1.00000001.3.330.0.0.3.14. A command injection vulnerability resides in the HOST/IP section of the NFS settings menu in the webserver running on the devi",
+      "cvss_score": 9.8,
+      "published": "2021-02-08"
+    },
+    {
+      "id": "CVE-2023-43744",
+      "description": "An OS command injection vulnerability in Zultys MX-SE, MX-SE II, MX-E, MX-Virtual, MX250, and MX30 with firmware versions prior to 17.0.10 patch 17161 and 16.04 patch 16109 allows an administrator to ",
+      "cvss_score": 7.2,
+      "published": "2023-12-08"
+    },
+    {
+      "id": "CVE-2024-41815",
+      "description": "Starship is a cross-shell prompt. Starting in version 1.0.0 and prior to version 1.20.0, undocumented and unpredictable shell expansion and/or quoting rules make it easily to accidentally cause shell ",
+      "cvss_score": 7.4,
+      "published": "2024-07-26"
+    }
+  ],
+  "process listing privilege escalation Linux": [],
+  "wget curl remote file download malware": [],
+  "SSH brute force authentication bypass": [
+    {
+      "id": "CVE-2020-25196",
+      "description": "The built-in WEB server for MOXA NPort IAW5000A-I/O firmware version 2.1 or lower allows SSH/Telnet sessions, which may be vulnerable to brute force attacks to bypass authentication.",
+      "cvss_score": 9.8,
+      "published": "2020-12-23"
+    },
+    {
+      "id": "CVE-2023-27100",
+      "description": "Improper restriction of excessive authentication attempts in the SSHGuard component of Netgate pfSense Plus software v22.05.1 and pfSense CE software v2.6.0 allows attackers to bypass brute force prot",
+      "cvss_score": 9.8,
+      "published": "2023-03-22"
+    }
+  ],
+  "network service scanning nmap port scan detection": [],
+  "sudo SUID privilege escalation Linux": [],
+  "unsecured credentials private key exposure Linux": [],
+  "log file deletion Linux audit": [],
+  "SSH remote service exploit": [
+    {
+      "id": "CVE-2002-1024",
+      "description": "Cisco IOS 12.0 through 12.2, when supporting SSH, allows remote attackers to cause a denial of service (CPU consumption) via a large packet that was designed to exploit the SSH CRC32 attack detection ",
+      "cvss_score": 7.1,
+      "published": "2002-10-04"
+    },
+    {
+      "id": "CVE-2002-1547",
+      "description": "Netscreen running ScreenOS 4.0.0r6 and earlier allows remote attackers to cause a denial of service via a malformed SSH packet to the Secure Command Shell (SCS) management interface, as demonstrated v",
+      "cvss_score": 5.0,
+      "published": "2003-03-31"
+    },
+    {
+      "id": "CVE-2007-4654",
+      "description": "Unspecified vulnerability in SSHield 1.6.1 with OpenSSH 3.0.2p1 on Cisco WebNS 8.20.0.1 on Cisco Content Services Switch (CSS) series 11000 devices allows remote attackers to cause a denial of service",
+      "cvss_score": 5.0,
+      "published": "2007-09-04"
+    }
+  ],
+  "service stop Linux systemctl exploit": [],
+  "local file collection sensitive data disclosure Linux": [],
+  "default credentials authentication bypass": [
+    {
+      "id": "CVE-2016-9463",
+      "description": "Nextcloud Server before 9.0.54 and 10.0.1 & ownCloud Server before 9.1.2, 9.0.6, and 8.2.9 suffer from SMB User Authentication Bypass. Nextcloud/ownCloud include an optional and not by default enabled",
+      "cvss_score": 8.1,
+      "published": "2017-03-28"
+    },
+    {
+      "id": "CVE-2017-14002",
+      "description": "GE Infinia/Infinia with Hawkeye 4 medical imaging systems all current versions are affected these devices use default or hard-coded credentials. Successful exploitation of this vulnerability may allow",
+      "cvss_score": 9.8,
+      "published": "2018-03-20"
+    },
+    {
+      "id": "CVE-2017-14004",
+      "description": "GE GEMNet License server (EchoServer) all current versions are affected these devices use default or hard-coded credentials. Successful exploitation of this vulnerability may allow a remote attacker t",
+      "cvss_score": 9.8,
+      "published": "2018-03-20"
+    }
+  ],
+  "data exfiltration HTTP POST C2 channel": [],
+  "HTTP covert channel command control": [],
+  "Linux kernel privilege escalation exploit": [
+    {
+      "id": "CVE-2017-6516",
+      "description": "A Local Privilege Escalation Vulnerability in MagniComp's Sysinfo before 10-H64 for Linux and UNIX platforms could allow a local attacker to gain elevated privileges. Parts of SysInfo require setuid-t",
+      "cvss_score": 6.7,
+      "published": "2017-03-14"
+    },
+    {
+      "id": "CVE-2019-18683",
+      "description": "An issue was discovered in drivers/media/platform/vivid in the Linux kernel through 5.3.8. It is exploitable for privilege escalation on some Linux distributions where local users have /dev/video0 acc",
+      "cvss_score": 7.0,
+      "published": "2019-11-04"
+    },
+    {
+      "id": "CVE-2021-23133",
+      "description": "A race condition in Linux kernel SCTP sockets (net/sctp/socket.c) before 5.12-rc8 can lead to kernel privilege escalation from the context of a network service or an unprivileged process. If sctp_dest",
+      "cvss_score": 6.7,
+      "published": "2021-04-22"
+    }
+  ],
+  "Linux user account creation exploit": [
+    {
+      "id": "CVE-2020-2016",
+      "description": "A race condition due to insecure creation of a file in a temporary directory vulnerability in PAN-OS allows for root privilege escalation from a limited linux user account. This allows an attacker who",
+      "cvss_score": 7.0,
+      "published": "2020-05-13"
+    },
+    {
+      "id": "CVE-2021-3784",
+      "description": "Garuda Linux performs an insecure user creation and authentication that allows any user to impersonate the created account. By creating users from the 'Garuda settings manager', an insecure procedure ",
+      "cvss_score": 5.3,
+      "published": "2023-10-04"
+    }
+  ],
+  "OpenSSH remote code execution": [
+    {
+      "id": "CVE-2014-6271",
+      "description": "GNU Bash through 4.3 processes trailing strings after function definitions in the values of environment variables, which allows remote attackers to execute arbitrary code via a crafted environment, as",
+      "cvss_score": 9.8,
+      "published": "2014-09-24"
+    },
+    {
+      "id": "CVE-2014-6277",
+      "description": "GNU Bash through 4.3 bash43-026 does not properly parse function definitions in the values of environment variables, which allows remote attackers to execute arbitrary code or cause a denial of servic",
+      "cvss_score": 10.0,
+      "published": "2014-09-27"
+    },
+    {
+      "id": "CVE-2023-25136",
+      "description": "OpenSSH server (sshd) 9.1 introduced a double-free vulnerability during options.kex_algorithms handling. This is fixed in OpenSSH 9.2. The double free can be leveraged, by an unauthenticated remote at",
+      "cvss_score": 6.5,
+      "published": "2023-02-03"
+    }
+  ],
+  "SSH VPN external remote access exploit": [],
+  "SSH authorized_keys manipulation": [],
+  "SSH password guessing authentication": [
+    {
+      "id": "CVE-2001-0572",
+      "description": "The SSH protocols 1 and 2 (aka SSH-2) as implemented in OpenSSH and other packages have various weaknesses which can allow a remote attacker to obtain the following information via sniffing: (1) passw",
+      "cvss_score": 7.5,
+      "published": "2001-08-22"
+    }
+  ],
+  "arbitrary code execution user privilege Linux": [
+    {
+      "id": "CVE-2016-8856",
+      "description": "Foxit Reader for Mac 2.1.0.0804 and earlier and Foxit Reader for Linux 2.1.0.0805 and earlier suffered from a vulnerability where weak file permissions could be exploited by attackers to execute arbit",
+      "cvss_score": 7.8,
+      "published": "2016-10-31"
+    },
+    {
+      "id": "CVE-2022-43973",
+      "description": "An arbitrary code execution vulnerability exisits in Linksys WRT54GL Wireless-G Broadband Router with firmware <= 4.30.18.006. The Check_TSSI function within the httpd binary uses unvalidated user inp",
+      "cvss_score": 7.2,
+      "published": "2023-01-09"
+    },
+    {
+      "id": "CVE-2023-0179",
+      "description": "A buffer overflow vulnerability was found in the Netfilter subsystem in the Linux Kernel. This issue could allow the leakage of both stack and heap addresses, and potentially allow Local Privilege Esc",
+      "cvss_score": 7.8,
+      "published": "2023-03-27"
+    }
+  ],
+  "base64 obfuscation malware Linux": [],
+  "cron job privilege escalation": [
+    {
+      "id": "CVE-2018-16497",
+      "description": "In Versa Analytics, the cron jobs are used for scheduling tasks by executing commands at specific dates and times on the server. If the job is run as the user root, there is a potential privilege esca",
+      "cvss_score": 7.8,
+      "published": "2021-05-26"
+    },
+    {
+      "id": "CVE-2025-54802",
+      "description": "pyLoad is the free and open-source Download Manager written in pure Python. In versions 0.5.0b3.dev89 and below, there is an opportunity for path traversal in pyLoad-ng CNL Blueprint via package param",
+      "cvss_score": 9.8,
+      "published": "2025-08-05"
+    },
+    {
+      "id": "CVE-2026-62202",
+      "description": "OpenClaw versions 2026.6.1 before 2026.6.9 contain a privilege escalation vulnerability in isolated cron jobs that allows lower-trust callers to regain denied execution tools. Attackers can execute or",
+      "cvss_score": 8.8,
+      "published": "2026-07-17"
+    }
+  ],
+  "cron privilege escalation Linux": [],
+  "cryptomining malware Linux CPU hijack": [],
+  "data destruction Linux filesystem wipe": [
+    {
+      "id": "CVE-2022-49899",
+      "description": "In the Linux kernel, the following vulnerability has been resolved:\n\nfscrypt: stop using keyrings subsystem for fscrypt_master_key\n\nThe approach of fs/crypto/ internally managing the fscrypt_master_ke",
+      "cvss_score": 7.8,
+      "published": "2025-05-01"
+    }
+  ],
+  "data exfiltration SSH SCP FTP": [],
+  "default account password Linux": [
+    {
+      "id": "CVE-2007-2282",
+      "description": "Cisco Network Services (CNS) NetFlow Collection Engine (NFC) before 6.0 has an nfcuser account with the default password nfcuser, which allows remote attackers to modify the product configuration and,",
+      "cvss_score": 10.0,
+      "published": "2007-04-26"
+    },
+    {
+      "id": "CVE-2010-4233",
+      "description": "The Linux installation on the Camtron CMNC-200 Full HD IP Camera and TecVoz CMNC-200 Megapixel IP Camera with firmware 1.102A-008 has a default password of m for the root account, and a default passwo",
+      "cvss_score": 10.0,
+      "published": "2010-11-17"
+    },
+    {
+      "id": "CVE-2010-3038",
+      "description": "Cisco Unified Videoconferencing (UVC) System 5110 and 5115, when the Linux operating system is used, has a default password for the (1) root, (2) cs, and (3) develop accounts, which makes it easier fo",
+      "cvss_score": 10.0,
+      "published": "2010-11-22"
+    }
+  ],
+  "directory traversal file disclosure": [
+    {
+      "id": "CVE-2006-0315",
+      "description": "index.php in EZDatabase before 2.1.2 does not properly cleanse the p parameter before constructing and including a .php filename, which allows remote attackers to conduct directory traversal attacks, ",
+      "cvss_score": 5.8,
+      "published": "2006-01-19"
+    },
+    {
+      "id": "CVE-2006-0660",
+      "description": "Multiple directory traversal vulnerabilities in FarsiNews 2.5 and earlier allows remote attackers to (1) read arbitrary files or trigger an error message path disclosure via \"..\"  or invalid names in ",
+      "cvss_score": 6.4,
+      "published": "2006-02-13"
+    },
+    {
+      "id": "CVE-2006-1762",
+      "description": "Directory traversal vulnerability in index.php in blur6ex 0.3.452 allows remote attackers to include arbitrary files via the shard parameter.  NOTE: this issue can be exploited to produce resultant XS",
+      "cvss_score": 7.5,
+      "published": "2006-04-13"
+    }
+  ],
+  "unix shell injection bash": [
+    {
+      "id": "CVE-2026-55673",
+      "description": "PowSyBl (Power System Blocks) is a framework to build power system oriented software. Prior to 7.2.2, UnixLocalCommandExecutor and WindowsLocalCommandExecutor concatenate command arguments and environ",
+      "cvss_score": 0.0,
+      "published": "2026-08-28"
+    }
+  ],
+  "local account enumeration Linux passwd": [],
+  "malicious executable download Linux noexec": [],
+  "network configuration disclosure ifconfig": [],
+  "password spraying account lockout": [
+    {
+      "id": "CVE-2025-56132",
+      "description": "LiquidFiles filetransfer server is vulnerable to a user enumeration issue in its password reset functionality. The application returns distinguishable responses for valid and invalid email addresses, ",
+      "cvss_score": 7.3,
+      "published": "2025-09-30"
+    }
+  ],
+  "public application RCE exploit CVE": [],
+  "python code execution exploit": [
+    {
+      "id": "CVE-2018-1000117",
+      "description": "Python Software Foundation CPython version From 3.2 until 3.6.4 on Windows contains a Buffer Overflow vulnerability in os.symlink() function on Windows that can result in Arbitrary code execution, lik",
+      "cvss_score": 6.7,
+      "published": "2018-03-07"
+    },
+    {
+      "id": "CVE-2018-1000807",
+      "description": "Python Cryptographic Authority pyopenssl version prior to version 17.5.0 contains a CWE-416: Use After Free vulnerability in X509 object handling that can result in Use after free can lead to possible",
+      "cvss_score": 8.1,
+      "published": "2018-10-08"
+    },
+    {
+      "id": "CVE-2020-1171",
+      "description": "A remote code execution vulnerability exists in Visual Studio Code when the Python extension loads configuration files after opening a project. An attacker who successfully exploited the vulnerability",
+      "cvss_score": 8.8,
+      "published": "2020-05-21"
+    }
+  ],
+  "user discovery Linux who": [
+    {
+      "id": "CVE-2024-38558",
+      "description": "In the Linux kernel, the following vulnerability has been resolved:\n\nnet: openvswitch: fix overwriting ct original tuple for ICMPv6\n\nOVS_PACKET_CMD_EXECUTE has 3 main attributes:\n - OVS_PACKET_ATTR_KE",
+      "cvss_score": 10.0,
+      "published": "2024-06-19"
+    }
+  ]
+}

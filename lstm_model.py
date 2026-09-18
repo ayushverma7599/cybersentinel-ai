@@ -113,10 +113,19 @@ class TechniqueVocab:
 # DATA LOADING
 # ─────────────────────────────────────────────
 
-def load_sessions(ttp_path: str = TTP_PATH) -> list[list[str]]:
+def load_real_sessions(ttp_path: str = TTP_PATH) -> list[list[str]]:
     """
     Load ttp_records.json → list of technique ID sequences per session.
     Each session = ordered list of MITRE technique IDs observed.
+
+    REAL DATA ONLY — no synthetic augmentation here. This is deliberate:
+    callers that need a training set must split real sessions into
+    train/test FIRST (see split_sessions()) and only augment the train
+    side (see augment_train_sessions()) afterwards. Augmenting before
+    splitting — the old behaviour — let synthetic (templated) sequences
+    land in the test set and inflated reported accuracy with what was
+    partly in-sample/memorized performance rather than genuine
+    generalization to real attacker behaviour.
 
     Handles both formats:
       - Plain strings:  ["T1082", "T1087"]
@@ -158,14 +167,75 @@ def load_sessions(ttp_path: str = TTP_PATH) -> list[list[str]]:
     real_techniques = sorted({t for s in sessions for t in s})
     print(f"[LSTM] Real techniques found: {real_techniques}")
 
-    # Always augment — synthetic sequences boost coverage of transition patterns.
-    # We generate sequences using ONLY the techniques actually in the data,
-    # so the vocab stays consistent and every synthetic sample is learnable.
-    synthetic = _targeted_synthetic(real_techniques)
-    print(f"[LSTM] Adding {len(synthetic)} targeted synthetic sequences for training")
-    sessions = sessions + synthetic
-
     return sessions
+
+
+def split_sessions(sessions: list[list[str]], test_split: float = 0.1) -> tuple:
+    """
+    Split REAL sessions into (train, test). Sorted by each session's first
+    technique, then every Nth session (N = round(1/test_split)) goes to
+    test — a simple stratified-ish split so techniques with enough sessions
+    get representation on both sides.
+
+    MUST run on real sessions BEFORE synthetic augmentation (see
+    load_real_sessions() / augment_train_sessions()) — augmenting first and
+    splitting after leaks synthetic sequences into the test set.
+    """
+    step = max(1, round(1 / test_split)) if test_split > 0 else len(sessions) + 1
+    sessions_sorted = sorted(sessions, key=lambda s: s[0] if s else "")
+    train_sessions = [s for i, s in enumerate(sessions_sorted) if i % step != 0]
+    test_sessions  = [s for i, s in enumerate(sessions_sorted) if i % step == 0]
+    return train_sessions, test_sessions
+
+
+def augment_train_sessions(train_sessions: list[list[str]], real_techniques: list[str]) -> list[list[str]]:
+    """
+    Add synthetic + optional real CIC-IDS-2018 T1110 sequences to the
+    TRAINING split ONLY. Never call this on a test split — see the warning
+    in split_sessions(). We generate synthetic sequences using ONLY the
+    techniques actually in the data, so the vocab stays consistent and
+    every synthetic sample is learnable.
+    """
+    synthetic = _targeted_synthetic(real_techniques)
+    print(f"[LSTM] Adding {len(synthetic)} targeted synthetic sequences "
+          f"(training split only — test split stays 100% real)")
+    augmented = train_sessions + synthetic
+
+    # Optional: real CIC-IDS-2018 brute-force supplement (see cic_ids_loader.py).
+    # This is REAL academic benchmark data, distinct from the rule-based
+    # synthetic sequences above — kept separate and clearly labeled so it's
+    # never confused with either the honeypot captures or the synthetic
+    # generator. Only ever contributes standalone T1110 observations (see
+    # cic_ids_loader.py's docstring for why: CIC-IDS-2018 is flow-level data
+    # with no surrounding technique context, so multi-step chains would be
+    # fabricated, not real). Silently skipped if the file doesn't exist —
+    # this dataset is optional, not a hard dependency of training.
+    cic_path = Path("cic_t1110_augment.json")
+    if cic_path.exists():
+        try:
+            with open(cic_path) as f:
+                cic_sequences = json.load(f)
+            print(f"[LSTM] Adding {len(cic_sequences)} real CIC-IDS-2018 "
+                  f"brute-force sequences (T1110 supplement, training only)")
+            augmented = augmented + cic_sequences
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[LSTM] WARNING: found {cic_path} but couldn't load it: {e}")
+
+    return augmented
+
+
+def load_sessions(ttp_path: str = TTP_PATH) -> list[list[str]]:
+    """
+    Backward-compatible convenience wrapper: real sessions plus training-
+    style augmentation, combined into one list with NO train/test boundary.
+
+    Do NOT use this to build a test/eval set — the returned list mixes
+    synthetic sequences in with real ones. Use load_real_sessions() +
+    split_sessions() instead, which keeps synthetic data out of test.
+    """
+    sessions = load_real_sessions(ttp_path)
+    real_techniques = sorted({t for s in sessions for t in s})
+    return augment_train_sessions(sessions, real_techniques)
 
 
 # Kill-chain stage order — used to constrain synthetic training sequences to
@@ -178,24 +248,31 @@ def load_sessions(ttp_path: str = TTP_PATH) -> list[list[str]]:
 # Lower number = earlier in a typical attack progression. Techniques not
 # listed default to a high rank (end of chain) rather than crashing.
 STAGE_RANK = {
-    # Discovery / recon — usually first
-    "T1082": 0, "T1083": 0, "T1057": 0, "T1016": 0, "T1033": 0,
-    "T1049": 0, "T1087": 0, "T1087.001": 0,
-    # Credential / initial access support
-    "T1110": 1, "T1110.001": 1, "T1110.003": 1, "T1552": 1,
-    "T1078": 1, "T1078.001": 1,
+    # Initial Access / Credential Access — the ENTRY POINT, always first.
+    # Brute force is how the attacker gets in; nothing precedes it.
+    "T1110": 0, "T1110.001": 0, "T1110.003": 0,
+    "T1078": 0, "T1078.001": 0, "T1190": 0, "T1133": 0,
+    # Discovery / recon — after gaining access
+    "T1082": 1, "T1083": 1, "T1033": 1,
+    "T1049": 1, "T1087": 1, "T1087.001": 1, "T1046": 1,
+    # Credential access (post-login credential theft)
+    "T1552": 1,
     # Ingress tool transfer / C2 staging
     "T1105": 2, "T1071": 2, "T1048": 2,
     # Execution
     "T1059": 3, "T1059.004": 3, "T1059.006": 3, "T1204": 3,
     "T1204.002": 3, "T1053": 3,
+    # Post-compromise / post-execution enumeration — placed AFTER execution to
+    # match attack.sh's actual Phase 4-5 ordering (ps aux, netstat, ifconfig,
+    # nmap run only after initial access + execution have happened).
+    "T1057": 4, "T1016": 4,
     # Persistence
-    "T1136": 4, "T1098": 4, "T1053.003": 4,
+    "T1136": 5, "T1098": 5, "T1053.003": 5,
     # Privilege escalation
-    "T1548": 5, "T1068": 5,
-    # Defense evasion / lateral movement / impact
-    "T1070": 6, "T1021": 6, "T1021.004": 6,
-    "T1485": 6, "T1489": 6, "T1496": 6,
+    "T1548": 6, "T1068": 6,
+    # Defense evasion / lateral movement / impact — end of chain
+    "T1070": 7, "T1021": 7, "T1021.004": 7,
+    "T1485": 7, "T1489": 7, "T1496": 7, "T1499": 7,
 }
 
 
@@ -264,39 +341,109 @@ def _targeted_synthetic(real_techniques: list[str]) -> list[list[str]]:
     real honeypot data. This keeps the vocab consistent and ensures every
     synthetic sample is learnable — no unknown technique IDs introduced.
 
-    Produces stage-order-constrained orderings of length 2, 3, and 4 from the
-    real technique set (see STAGE_RANK / _forward_orderings — this replaces
-    the old unconstrained itertools.permutations(), which generated
-    backwards attack chains and taught the model contradictory transitions),
-    plus weighted repetitions of the most important kill chain pattern(s).
+    BALANCED generation (fixes class collapse):
+    Earlier versions used unconstrained combinations, which made discovery
+    techniques (T1082/T1087) and T1110 appear as prediction targets far more
+    often than rare techniques (T1016/T1105). The model then collapsed to
+    always predicting the 2-3 most frequent classes (31% accuracy, everything
+    guessed as T1087/T1110).
 
-    Each forward-ordered sequence is repeated FORWARD_REPEAT times. Removing
-    backward permutations cut synthetic volume by ~75% (60 -> 15 unique
-    sequences for a 4-technique vocab), and that volume loss — not the
-    direction fix itself — is what caused prediction confidence to collapse
-    (top-1 softmax probs dropping to near-random ~26-33%) even though raw
-    accuracy improved. Repeating the *correct* sequences restores enough
-    training signal for the model to commit to confident predictions,
-    without reintroducing any of the wrong-direction transitions.
+    This version guarantees each technique appears as a PREDICTION TARGET
+    roughly equally, by building sequences that END on each technique in turn.
+    Stage-order is still respected (via _forward_orderings), so no backwards
+    chains are introduced. The result is a class-balanced training set where
+    the model must actually learn each technique's context, not just memorise
+    the frequency prior.
     """
     import itertools
-    FORWARD_REPEAT = 3  # restores volume lost by dropping backward permutations
-    seqs = []
-    techs = real_techniques  # e.g. ['T1082', 'T1087', 'T1105', 'T1204']
+    from collections import Counter
 
-    # All pairs, triples, quadruples — but only stage-order-respecting orderings
+    seqs = []
+    techs = list(real_techniques)
+    if len(techs) < 2:
+        return seqs
+
+    # ── Step 1: generate all stage-ordered subsequences up to length 4 ────────
+    # Cap at length 4: longer chains multiply intermediate-target counts for
+    # discovery techniques (which appear in every chain), unbalancing the set.
+    raw = []
     for size in range(2, min(4, len(techs)) + 1):
         for subset in itertools.combinations(techs, size):
-            seqs.extend(_forward_orderings(subset, STAGE_RANK) * FORWARD_REPEAT)
+            raw.extend(_forward_orderings(subset, STAGE_RANK))
 
-    # Extra weight on the canonical kill chain pattern(s) observed in your data
-    # T1082 → T1087 → T1105 → T1204 repeated so the model learns this strongly
-    canonical = [t for t in ["T1082", "T1087", "T1105", "T1204"] if t in techs]
-    if len(canonical) >= 2:
-        for _ in range(6):
+    # ── Step 2: balance by PREDICTION TARGET frequency ────────────────────────
+    # A training sample predicts full_seq[i] from full_seq[:i], so every
+    # position after the first is a target. Naively, discovery techniques
+    # (in every chain) dominate. We fix this by:
+    #   (a) counting each technique's natural target frequency in `raw`
+    #   (b) down-sampling over-represented techniques' sequences
+    #   (c) up-sampling under-represented ones
+    # so every technique ends up as a target ~TARGET_PER_TECHNIQUE times.
+    TARGET_PER_TECHNIQUE = 200
+
+    # Group sequences by their LAST element (primary target signal)
+    by_ending = {t: [] for t in techs}
+    for s in raw:
+        by_ending[s[-1]].append(s)
+
+    # Cap how hard we'll duplicate a tiny natural pool to reach TARGET_PER_TECHNIQUE.
+    # Rank-0 techniques (T1110, T1078 — the entry-point stage) structurally have
+    # almost nowhere valid to END a stage-ordered chain: with only 2 techniques
+    # sharing rank 0, the only sequence that can end in either of them is the
+    # single 2-element permutation of the other one followed by it (e.g.
+    # [T1078, T1110]). That's ONE distinct sequence — and naive duplication to
+    # TARGET_PER_TECHNIQUE=200 copied that single sequence 200 times, teaching
+    # "T1078 -> T1110" (and the reverse) as if it were as common a transition as
+    # the ~200 genuinely-diverse chains every other technique got. That's what
+    # was pulling next-step predictions from unrelated contexts (T1046, T1049,
+    # T1082, T1087, T1552 -> ...) toward T1110/T1078 in the eval confusion
+    # matrix: the model over-learned two narrow, massively-duplicated edges.
+    # Real single-technique brute-force sessions in ttp_records.json already
+    # teach "<START> -> T1110" plenty on their own (there were 128 of them in
+    # the last run) — the synthetic generator doesn't need to manufacture more
+    # of that signal, and definitely shouldn't manufacture it via 200x copies
+    # of one sequence. Capping the duplication factor keeps a structurally-rare
+    # technique's synthetic weight proportionate to how rare that transition
+    # actually is, instead of forcing false parity with common mid-chain steps.
+    MAX_DUP_FACTOR = 5
+
+    import random
+    random.seed(42)
+    balanced = []
+    for tech in techs:
+        pool = by_ending[tech]
+        if not pool:
+            continue
+        if len(pool) >= TARGET_PER_TECHNIQUE:
+            # Over-represented: sample down to target
+            balanced.extend(random.sample(pool, TARGET_PER_TECHNIQUE))
+        else:
+            # Under-represented: repeat to reach target, but capped — see
+            # MAX_DUP_FACTOR note above. A pool this small gets fewer than
+            # TARGET_PER_TECHNIQUE samples rather than drowning training in
+            # duplicates of one or two sequences.
+            reps = min(TARGET_PER_TECHNIQUE // len(pool), MAX_DUP_FACTOR)
+            actual_count = reps * len(pool)
+            balanced.extend(pool * reps)
+            if actual_count < TARGET_PER_TECHNIQUE:
+                print(f"[LSTM] NOTE: {tech} has only {len(pool)} natural stage-ordered "
+                      f"chain(s) ending in it — capped at {actual_count}/{TARGET_PER_TECHNIQUE} "
+                      f"synthetic samples (duplicating further would teach a structurally-rare "
+                      f"transition as if it were common)")
+
+    seqs.extend(balanced)
+
+    # ── Step 3: reinforce the real canonical kill chain ───────────────────────
+    # attack.sh order: brute force -> recon -> tool transfer -> execution -> enum
+    # This teaches the full T1110 -> ... progression that judges will demo.
+    canonical_order = ["T1110", "T1082", "T1087", "T1105", "T1059",
+                       "T1204", "T1057", "T1016", "T1548"]
+    canonical = [t for t in canonical_order if t in techs]
+    if len(canonical) >= 3:
+        for _ in range(15):
             seqs.append(canonical)
-            seqs.append(canonical[:3])  # partial chain too
-            seqs.append(canonical[:2])
+            seqs.append(canonical[:len(canonical) // 2])
+            seqs.append(canonical[:2])   # T1110 -> T1082 entry pattern
 
     return seqs
 
@@ -541,30 +688,33 @@ def train(ttp_path: str = TTP_PATH,
     random.seed(seed)
     torch.manual_seed(seed)
 
-    # Load sessions
-    sessions = load_sessions(ttp_path)
+    # Load REAL sessions and split BEFORE any synthetic augmentation, so
+    # synthetic (templated) sequences can never leak into the test set —
+    # see split_sessions()'s docstring. This is the same class of
+    # train/test leakage bug already found and fixed in world_model.py
+    # this project (segment-purged split), applied here too.
+    real_sessions = load_real_sessions(ttp_path)
+    real_techniques = sorted({t for s in real_sessions for t in s})
 
-    # Build vocabulary from all sessions
+    train_real, test_sessions = split_sessions(real_sessions, test_split=test_split)
+    train_sessions = augment_train_sessions(train_real, real_techniques)
+
+    # Build vocabulary from every technique ever seen (real + synthetic) —
+    # vocabulary/tokenization coverage isn't a leakage issue, only sharing
+    # actual train/test EXAMPLES is.
     vocab = TechniqueVocab()
-    for session in sessions:
+    for session in train_sessions + test_sessions:
         for tid in session:
             vocab.add(tid)
         vocab.add(START_TOKEN)
 
     print(f"[LSTM] Vocabulary: {len(vocab)} tokens ({len(vocab)-3} unique techniques)")
 
-    # Split train/test
-    # Stratified split: ensure all 4 techniques appear in both train and test.
-    # Simple approach: sort by first technique, then interleave train/test.
-    sessions_sorted = sorted(sessions, key=lambda s: s[0] if s else "")
-    train_sessions = [s for i, s in enumerate(sessions_sorted) if i % 10 != 0]
-    test_sessions  = [s for i, s in enumerate(sessions_sorted) if i % 10 == 0]
-
     # Show what techniques appear in each split
     train_techs = sorted({t for s in train_sessions for t in s})
     test_techs  = sorted({t for s in test_sessions  for t in s})
     print(f"[LSTM] Train techniques: {train_techs}")
-    print(f"[LSTM] Test  techniques: {test_techs}")
+    print(f"[LSTM] Test  techniques: {test_techs}  (100% real sessions — zero synthetic in test)")
 
     train_ds = AttackSequenceDataset(train_sessions, vocab)
     test_ds  = AttackSequenceDataset(test_sessions, vocab)
@@ -574,17 +724,40 @@ def train(ttp_path: str = TTP_PATH,
 
     print(f"[LSTM] Train samples: {len(train_ds)}, Test samples: {len(test_ds)}")
 
-    # Model
-    model = AttackLSTM(vocab_size=len(vocab), embed_dim=16, hidden_dim=32, num_layers=1)
+    # ── Compute class weights from training target distribution ───────────────
+    # Even with balanced synthetic data, class weighting stops the model from
+    # winning by ignoring rare classes. weight = total / (n_classes * count).
+    from collections import Counter
+    target_counts = Counter()
+    for _, target, _ in train_ds:
+        t = target.item() if hasattr(target, "item") else target
+        target_counts[t] += 1
+
+    n_classes = len(vocab)
+    total_targets = sum(target_counts.values())
+    class_weights = torch.ones(n_classes)
+    for idx in range(n_classes):
+        cnt = target_counts.get(idx, 0)
+        if cnt > 0:
+            class_weights[idx] = total_targets / (len(target_counts) * cnt)
+    # Cap extreme weights to avoid instability
+    class_weights = torch.clamp(class_weights, max=5.0)
+    class_weights[0] = 0.0   # PAD gets zero weight
+
+    # Model — capacity scaled to vocabulary size.
+    # embed=16/hidden=32 was tuned for 4 techniques; with 8+ techniques the
+    # model needs more capacity to separate classes (was collapsing to the
+    # 2 most frequent). Scale hidden dim with vocab.
+    embed_dim  = 32
+    hidden_dim = 64
+    num_layers = 2
+    model = AttackLSTM(vocab_size=len(vocab), embed_dim=embed_dim,
+                       hidden_dim=hidden_dim, num_layers=num_layers)
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    # CosineAnnealingLR smoothly decays LR from lr → 0 over all epochs.
-    # Much more effective than ReduceLROnPlateau for small datasets where
-    # loss decreases slowly and patience-based reduction never triggers.
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
-    criterion = nn.CrossEntropyLoss(ignore_index=0)  # ignore PAD
-    # BCE loss for the infiltration-probability head. Without this, fc_prob
-    # never receives a gradient and its output is meaningless random noise —
-    # this is what supervises "does this predicted step imply compromise".
+    # Class-weighted cross-entropy — the key fix for class collapse.
+    criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=0)
+    # BCE loss for the infiltration-probability head.
     inf_criterion = nn.BCELoss()
 
     train_losses = []
@@ -651,9 +824,9 @@ def train(ttp_path: str = TTP_PATH,
         "vocab_tok2idx": vocab.tok2idx,
         "vocab_idx2tok": {str(k): v for k, v in vocab.idx2tok.items()},
         "vocab_next": vocab._next,
-        "embed_dim": 16,
-        "hidden_dim": 32,
-        "num_layers": 1,
+        "embed_dim": embed_dim,
+        "hidden_dim": hidden_dim,
+        "num_layers": num_layers,
     }, MODEL_PATH)
 
     # Verify the save round-trips *now* — catch corruption at save time
@@ -798,7 +971,7 @@ def predict_next_technique(session_techniques: list[str],
 
 def k_step_forecast(session_techniques: list[str],
                     k: int = 3,
-                    threshold: float = 0.15,
+                    threshold: float = None,
                     model_path: str = MODEL_PATH) -> dict:
     """
     Roll the LSTM forward k steps from the observed sequence.
@@ -806,10 +979,25 @@ def k_step_forecast(session_techniques: list[str],
     Stop early if infiltration probability exceeds 0.9 or confidence drops below threshold.
 
     Returns predicted attack kill chain with probability at each step.
+
+    `threshold` is the minimum softmax confidence required to accept a
+    forecasted step. Leave it as None (default) to use a threshold scaled
+    to the model's vocabulary size — 1.5x the random-guess baseline
+    (1.5 / len(vocab)) — instead of a fixed absolute cutoff. A fixed 0.15
+    was fine when the vocabulary had ~8 techniques (random baseline ~9%,
+    so 0.15 was a real bar above chance), but it silently broke forecasting
+    once the registry grew to 24 techniques: random baseline dropped to
+    ~4%, top-1 confidence naturally spreads thinner across more classes,
+    and a "confident, well above chance" prediction can now legitimately
+    sit under 0.15 — causing every forecast to stop at step 0. Pass an
+    explicit float to override.
     """
     model, vocab = load_model(model_path)
     if model is None:
         return {"error": "Model not trained"}
+
+    if threshold is None:
+        threshold = 1.5 / len(vocab)
 
     current_seq = list(session_techniques)
     forecast_steps = []
@@ -822,7 +1010,12 @@ def k_step_forecast(session_techniques: list[str],
         else:
             encoded = [vocab.encode(PAD_TOKEN)] * (max_seq_len - len(encoded)) + encoded
 
-        top_preds, inf_prob = model.predict_next(encoded, top_k=5)
+        # Search deeper than top-5 so that already-seen techniques / special
+        # tokens filling the top slots can't exhaust the candidate pool
+        # before we reach a real, novel next-step prediction — this gets
+        # more important as the vocabulary (and therefore the number of
+        # "already seen" or irrelevant top-k slots) grows.
+        top_preds, inf_prob = model.predict_next(encoded, top_k=min(len(vocab), 15))
         if not top_preds:
             break
 
@@ -866,6 +1059,7 @@ def k_step_forecast(session_techniques: list[str],
             "LOW"
         ),
         "full_predicted_chain": session_techniques + [s["predicted_technique"] for s in forecast_steps],
+        "threshold_used": threshold,
     }
 
 
@@ -873,14 +1067,27 @@ def k_step_forecast(session_techniques: list[str],
 # EVALUATION
 # ─────────────────────────────────────────────
 
-def evaluate(model_path: str = MODEL_PATH, ttp_path: str = TTP_PATH):
-    """Evaluate model on all sessions and print per-technique accuracy + confusion matrix."""
+def evaluate(model_path: str = MODEL_PATH, ttp_path: str = TTP_PATH, test_split: float = 0.1):
+    """
+    Evaluate the model on its held-out test split ONLY.
+
+    Previously this evaluated on load_sessions()'s full combined output —
+    train sessions, test sessions, AND synthetic sequences all mixed
+    together — so the reported accuracy was dominated by in-sample
+    (memorized) performance, not genuine held-out generalization. This now
+    reproduces the exact same real-sessions split train() used (same
+    default test_split, same split_sessions() logic) and evaluates purely
+    on that held-out, 100%-real portion.
+    """
     model, vocab = load_model(model_path)
     if model is None:
         return
 
-    sessions = load_sessions(ttp_path)
-    ds = AttackSequenceDataset(sessions, vocab)
+    real_sessions = load_real_sessions(ttp_path)
+    _, test_sessions = split_sessions(real_sessions, test_split=test_split)
+    print(f"[LSTM] Evaluating on {len(test_sessions)} held-out REAL sessions "
+          f"(same split train() used — zero synthetic, zero train-set leakage)")
+    ds = AttackSequenceDataset(test_sessions, vocab)
     loader = DataLoader(ds, batch_size=32, shuffle=False)
 
     model.eval()
@@ -895,15 +1102,22 @@ def evaluate(model_path: str = MODEL_PATH, ttp_path: str = TTP_PATH):
     # for non-compromise targets? If not, fc_prob still isn't learning.
     compromise_probs = []
     non_compromise_probs = []
+    # Top-k accuracy: for attack forecasting, "the next step is one of these
+    # 2-3 techniques" is what a defender acts on. Standard metric for
+    # sequence prediction where multiple next-steps are genuinely plausible.
+    top2_correct = 0
+    top3_correct = 0
 
     with torch.no_grad():
         for inp, target, compromise in loader:
             logits, prob = model(inp)
             preds = logits.argmax(dim=1)
+            # Top-3 predictions per sample
+            topk = torch.topk(logits, k=min(3, logits.size(1)), dim=1).indices
             prob_list = prob.squeeze(1).tolist()
-            for pred, tgt, is_compromise, p in zip(
+            for i, (pred, tgt, is_compromise, p) in enumerate(zip(
                 preds.tolist(), target.tolist(), compromise.tolist(), prob_list
-            ):
+            )):
                 if tgt == 0:
                     continue
                 actual = vocab.decode(tgt)
@@ -914,18 +1128,33 @@ def evaluate(model_path: str = MODEL_PATH, ttp_path: str = TTP_PATH):
                 if pred == tgt:
                     correct += 1
                     per_tech_correct[actual] += 1
+                # Top-k hits
+                topk_ids = topk[i].tolist()
+                if tgt in topk_ids[:2]:
+                    top2_correct += 1
+                if tgt in topk_ids[:3]:
+                    top3_correct += 1
                 total += 1
                 (compromise_probs if is_compromise else non_compromise_probs).append(p)
 
     overall = correct / total if total > 0 else 0
+    top2_acc = top2_correct / total if total > 0 else 0
+    top3_acc = top3_correct / total if total > 0 else 0
     baseline = 1.0 / max(len(per_tech_total), 1)  # random chance
 
     print("\n" + "═" * 55)
     print("  CYBERSENTINEL LSTM — EVALUATION REPORT")
     print("═" * 55)
-    print(f"  Overall accuracy:  {overall:.1%}  ({correct}/{total} correct)")
+    print(f"  Top-1 accuracy:    {overall:.1%}  ({correct}/{total} correct)")
+    print(f"  Top-2 accuracy:    {top2_acc:.1%}  (true next-step in model's top 2 guesses)")
+    print(f"  Top-3 accuracy:    {top3_acc:.1%}  (true next-step in model's top 3 guesses)")
     print(f"  Random baseline:   {baseline:.1%}  (1 / {len(per_tech_total)} classes)")
-    print(f"  Lift over random:  {overall/baseline:.1f}×")
+    print(f"  Lift over random:  {overall/baseline:.1f}×  (top-1)")
+    print()
+    print("  Note: For attack forecasting, top-2/top-3 is the operationally")
+    print("  relevant metric — a defender acts on 'the next step is likely")
+    print("  one of these', and several techniques are genuinely plausible")
+    print("  at each stage of a real kill chain.")
     print()
     print("  Per-technique accuracy:")
     for tech, tot in sorted(per_tech_total.items(), key=lambda x: -x[1]):
@@ -987,6 +1216,9 @@ def main():
     parser.add_argument("--ttp",     default=TTP_PATH, help="Path to ttp_records.json")
     parser.add_argument("--epochs",  type=int, default=200)
     parser.add_argument("--k",       type=int, default=3, help="Steps for k-step forecast")
+    parser.add_argument("--forecast-threshold", type=float, default=None,
+                        help="Min confidence to accept a forecast step (default: "
+                             "scaled to vocab size, 1.5x random baseline)")
     args = parser.parse_args()
 
     # Default: train if no model exists, then predict
@@ -1021,14 +1253,24 @@ def main():
         print("\n" + "=" * 55)
         print("  CyberSentinel LSTM — K-Step Forecast")
         print("=" * 55)
-        result = k_step_forecast(args.forecast, k=args.k)
-        print(f"  Observed:  {' → '.join(result['observed_sequence'])}")
-        print(f"  Forecast steps:")
-        for step in result["forecast_steps"]:
-            print(f"    Step {step['step']}: {step['predicted_technique']} "
-                  f"(conf={step['confidence']:.0%}, P(compromise)={step['infiltration_prob']:.0%})")
-        print(f"  Final infiltration prob: {result['final_infiltration_prob']:.1%}  [{result['risk_label']}]")
-        print(f"  Full predicted chain:    {' → '.join(result['full_predicted_chain'])}")
+        result = k_step_forecast(args.forecast, k=args.k, threshold=args.forecast_threshold)
+        if result.get("error"):
+            print(f"  [!] {result['error']}")
+        else:
+            print(f"  Confidence threshold: {result['threshold_used']:.1%} "
+                  f"({'explicit' if args.forecast_threshold is not None else 'auto, scaled to vocab size'})")
+            print(f"  Observed:  {' → '.join(result['observed_sequence'])}")
+            print(f"  Forecast steps:")
+            if result["forecast_steps"]:
+                for step in result["forecast_steps"]:
+                    print(f"    Step {step['step']}: {step['predicted_technique']} "
+                          f"(conf={step['confidence']:.0%}, P(compromise)={step['infiltration_prob']:.0%})")
+            else:
+                print("    (none — model's top prediction never cleared the confidence "
+                      "threshold above. Try --forecast-threshold with a lower value to "
+                      "see low-confidence guesses anyway.)")
+            print(f"  Final infiltration prob: {result['final_infiltration_prob']:.1%}  [{result['risk_label']}]")
+            print(f"  Full predicted chain:    {' → '.join(result['full_predicted_chain'])}")
 
     if args.explain:
         print("\n" + "=" * 55)

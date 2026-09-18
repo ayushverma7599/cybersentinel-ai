@@ -65,13 +65,36 @@ except ImportError:
 # Wednesday file chosen: contains SSH Brute Force (maps to T1110)
 # which is the technique missing from your honeypot data
 CIC_S3_BASE = "https://cse-cic-ids2018.s3.ca-central-1.amazonaws.com/Processed%20Traffic%20Data%20for%20ML%20Algorithms/"
+
+# All 10 days of the published dataset. Each day = its own attack category,
+# which matters for CyberSentinel specifically: the technique-classification
+# head only predicts the 10-class COMPROMISE_TECHNIQUES set (T1105, T1204,
+# T1059, T1548, T1136, T1070, T1499, T1498, T1071, T1190) — Wednesday's
+# brute-force traffic maps to T1110, which is OUTSIDE that set, so it helps
+# the binary infiltration benchmark but adds zero technique-classification
+# training signal. The days commented "-> Txxxx" below are the ones that
+# actually feed the technique head; pull those first if technique top-k
+# accuracy (not just binary F1) is what you're trying to move.
 CIC_FILES = {
-    "Wednesday-14-02-2018": "Wednesday-14-02-2018_TrafficForML_CICFlowMeter.csv",
-    "Thursday-15-02-2018":  "Thursday-15-02-2018_TrafficForML_CICFlowMeter.csv",
-    "Friday-16-02-2018":    "Friday-16-02-2018_TrafficForML_CICFlowMeter.csv",
+    "Wednesday-14-02-2018": "Wednesday-14-02-2018_TrafficForML_CICFlowMeter.csv",   # FTP/SSH Brute Force -> T1110 (binary only)
+    "Thursday-15-02-2018":  "Thursday-15-02-2018_TrafficForML_CICFlowMeter.csv",    # DoS GoldenEye/Slowloris -> T1499
+    "Friday-16-02-2018":    "Friday-16-02-2018_TrafficForML_CICFlowMeter.csv",      # DoS Hulk/SlowHTTPTest -> T1499
+    # NOTE: the real object on S3 is misspelled "Thuesday" (not "Tuesday") —
+    # this is a genuine typo in the original CIC-IDS-2018 publication itself,
+    # confirmed by listing the bucket directly (a plain "Tuesday-..." request
+    # 404s). The dict KEY stays correctly spelled since that's the --day
+    # value users type; only the filename VALUE needs to match upstream's
+    # actual (misspelled) key so downloads/local filenames resolve.
+    "Tuesday-20-02-2018":   "Thuesday-20-02-2018_TrafficForML_CICFlowMeter.csv",    # DDoS LOIC-UDP -> T1498 (~4.05GB, much larger than every other day)
+    "Wednesday-21-02-2018": "Wednesday-21-02-2018_TrafficForML_CICFlowMeter.csv",   # DDoS LOIC-HTTP/HOIC -> T1498
+    "Thursday-22-02-2018":  "Thursday-22-02-2018_TrafficForML_CICFlowMeter.csv",    # Web Brute Force/XSS -> T1110/T1059
+    "Friday-23-02-2018":    "Friday-23-02-2018_TrafficForML_CICFlowMeter.csv",      # Web XSS/SQL Injection -> T1059/T1190
+    "Wednesday-28-02-2018": "Wednesday-28-02-2018_TrafficForML_CICFlowMeter.csv",   # Infiltration -> T1105
+    "Thursday-01-03-2018":  "Thursday-01-03-2018_TrafficForML_CICFlowMeter.csv",    # Infiltration -> T1105
+    "Friday-02-03-2018":    "Friday-02-03-2018_TrafficForML_CICFlowMeter.csv",      # Botnet (Ares) -> T1071
 }
 
-# Default: Wednesday (SSH Brute Force day)
+# Default: Wednesday (SSH Brute Force day) — already on disk in most setups
 DEFAULT_FILE = "Wednesday-14-02-2018"
 
 # ─────────────────────────────────────────────────────────
@@ -101,7 +124,19 @@ CIC_LABEL_TO_MITRE = {
     "DDoS attacks-LOIC-HTTP":       "T1498",
 
     # Infiltration
+    # NOTE: the real Label string in the official CIC-IDS-2018 CSVs is
+    # "Infilteration" (misspelled, extra "e") — NOT "Infiltration". Confirmed
+    # by scanning the raw Wednesday-28-02-2018 / Thursday-01-03-2018 files
+    # directly: 68,871 + 93,063 rows carry this exact misspelled label, and
+    # none of them matched the correctly-spelled key below (nor the
+    # substring fallback in _row_to_feature_vector, since "infiltration" is
+    # not a contiguous substring of "infilteration" — the letters are
+    # transposed). Every one of those ~162k real attack rows was silently
+    # falling through to mitre=None -> "BENIGN" before this fix. This is the
+    # same kind of upstream-typo quirk as the "Thuesday" S3 filename (see
+    # CIC_FILES above) — keeping both spellings mapped here for robustness.
     "Infiltration":                 "T1105",
+    "Infilteration":                "T1105",
 
     # Botnet
     "Bot":                          "T1071",
@@ -189,35 +224,68 @@ def download_cic(day: str = DEFAULT_FILE,
     url      = CIC_S3_BASE + filename
     out_path = os.path.join(output_dir, filename)
 
+    # Resume support: a previous attempt can be cut short by a read timeout
+    # partway through — confirmed happening on this exact ~4GB file (a
+    # single 30s stall mid-transfer killed an otherwise-progressing
+    # download at 9%/384MB). An existing file here is NOT necessarily
+    # "already downloaded" — the old code assumed that unconditionally,
+    # which would have silently handed a truncated, corrupt CSV to every
+    # downstream step with zero warning. Treat it as a resume point via an
+    # HTTP Range request instead.
+    resume_from = 0
+    mode = "wb"
+    headers = {}
     if os.path.exists(out_path):
-        print(f"[CIC] Already exists: {out_path}")
-        return out_path
+        resume_from = os.path.getsize(out_path)
+        headers["Range"] = f"bytes={resume_from}-"
+        mode = "ab"
+        print(f"[CIC] Found existing file ({resume_from // 1024 // 1024}MB) — checking whether to resume")
 
     print(f"[CIC] Downloading {filename}...")
     print(f"[CIC] URL: {url}")
-    print(f"[CIC] This file is ~200MB — may take a few minutes")
 
     try:
-        resp = requests.get(url, stream=True, timeout=30)
+        # (connect_timeout, read_timeout): 30s to establish the connection,
+        # 120s per chunk read. The old single timeout=30 applied AS the
+        # per-read timeout too — fine for a ~200MB file, much too tight for
+        # a multi-GB transfer where any brief stall kills the whole thing.
+        resp = requests.get(url, stream=True, timeout=(30, 120), headers=headers)
+
+        if resume_from and resp.status_code == 416:
+            # Range start == the file's true total size: nothing left to
+            # fetch, this file was already complete.
+            print(f"[CIC] Already fully downloaded: {out_path}")
+            resp.close()
+            return out_path
+
+        if resume_from and resp.status_code == 200:
+            # Server ignored the Range request and is sending the whole
+            # file again — restart clean rather than appending a full
+            # second copy onto our partial one.
+            print("[CIC] Server did not honor resume — restarting from scratch")
+            resume_from = 0
+            mode = "wb"
+
         resp.raise_for_status()
 
-        total = int(resp.headers.get("content-length", 0))
-        downloaded = 0
-        with open(out_path, "wb") as f:
+        total = int(resp.headers.get("content-length", 0)) + resume_from
+        downloaded = resume_from
+        with open(out_path, mode) as f:
             for chunk in resp.iter_content(chunk_size=65536):
                 f.write(chunk)
                 downloaded += len(chunk)
                 if total > 0:
                     pct = 100 * downloaded // total
-                    print(f"\r[CIC] {pct}% ({downloaded // 1024 // 1024}MB)", end="")
+                    print(f"\r[CIC] {pct}% ({downloaded // 1024 // 1024}MB / {total // 1024 // 1024}MB)", end="")
         print()
         print(f"[CIC] Downloaded to {out_path}")
         return out_path
 
     except Exception as e:
         print(f"[CIC] Download failed: {e}")
-        print(f"[CIC] Manual download:")
-        print(f"  wget '{url}'")
+        print(f"[CIC] Progress is saved on disk — just re-run the same command to resume from here.")
+        print(f"[CIC] Manual download (resumable):")
+        print(f"  wget -c '{url}' -O '{out_path}'")
         return None
 
 
@@ -226,13 +294,30 @@ def download_cic(day: str = DEFAULT_FILE,
 # ─────────────────────────────────────────────────────────
 
 def load_cic_csv(csv_path: str,
-                 max_rows: int = 10000,
-                 balance: bool = True) -> list[dict]:
+                 max_rows: int = 20000,
+                 balance: bool = True,
+                 seed: int = 42,
+                 day_label: str | None = None,
+                 chunksize: int = 200_000) -> list[dict]:
     """
     Load a CIC-IDS-2018 CSV and convert to CyberSentinel feature vectors.
 
-    max_rows: limit rows for memory — CIC files have millions of flows
-    balance:  balance benign vs attack samples (prevent class imbalance)
+    Scans the WHOLE file in chunks and builds a stratified sample across it.
+    The previous version read only the first `max_rows * 3` rows via
+    `nrows=` — CIC-IDS-2018 days are laid out as long contiguous runs (often
+    benign-only for a stretch, then an attack window), so a head-only read
+    can badly over- or under-represent the attack traffic depending on
+    where in the ~1M-row file it happens to fall, without any warning that
+    that's what happened.
+
+    max_rows: target OUTPUT sample size (not an input row cap — the file is
+              scanned in full regardless of its size).
+    balance:  aim for ~50/50 benign vs attack in the output sample.
+    seed:     deterministic sampling — same seed, same sample, every run.
+    day_label: tags every row's `source` field (e.g. "Wednesday-14-02-2018")
+              so world_model.py treats each day as its own segment instead
+              of silently blending it with anything else. Auto-derived from
+              the filename when not given.
     """
     if not PANDAS_OK:
         print("[CIC] pandas required. Install: pip install pandas --break-system-packages")
@@ -242,63 +327,105 @@ def load_cic_csv(csv_path: str,
         print(f"[CIC] File not found: {csv_path}")
         return []
 
-    print(f"[CIC] Loading {csv_path}...")
+    if day_label is None:
+        day_label = Path(csv_path).stem.split("_TrafficForML")[0]
+
+    rng = __import__("random").Random(seed)
+    target_per_class = max(1, max_rows // 2) if balance else max_rows
+    keep_cap = target_per_class * 3  # trim running lists back to this before they balloon
+
+    print(f"[CIC] Scanning {csv_path} in chunks of {chunksize} rows "
+          f"(day_label={day_label!r})...")
+
+    benign_rows: list = []
+    attack_rows: list = []
+    total_seen = 0
+    label_col = None
 
     try:
-        # Read with error handling for CIC's mixed encoding
-        df = pd.read_csv(
-            csv_path,
-            encoding="utf-8",
-            on_bad_lines="skip",
-            nrows=max_rows * 3,    # read extra to allow balancing
-            low_memory=False,
-        )
+        reader = pd.read_csv(csv_path, encoding="utf-8", on_bad_lines="skip",
+                              low_memory=False, chunksize=chunksize)
+        for chunk in reader:
+            chunk.columns = [c.strip() for c in chunk.columns]
+            if label_col is None:
+                for possible in ["Label", "label"]:
+                    if possible in chunk.columns:
+                        label_col = possible
+                        break
+                if label_col is None:
+                    print(f"[CIC] Warning: No Label column found. Columns: {list(chunk.columns[:10])}")
+                    chunk["Label"] = "BENIGN"
+                    label_col = "Label"
+
+            chunk = chunk.replace([float("inf"), float("-inf")], 0).fillna(0)
+            # CICFlowMeter files are concatenations of multiple capture
+            # sessions, each with its own header line — a handful of rows
+            # per file are that literal header ("Label,Dst Port,...") parsed
+            # as a normal data row, i.e. the Label column reads back the
+            # string "Label" itself. Confirmed via audit_cic_labels.py: 1-33
+            # such rows per file, out of 300k-1M+ real rows. Drop them here
+            # rather than letting them silently count as BENIGN.
+            chunk = chunk[chunk[label_col].astype(str).str.strip() != label_col]
+            is_benign = chunk[label_col].astype(str).str.upper() == "BENIGN"
+            benign_chunk = chunk[is_benign]
+            attack_chunk = chunk[~is_benign]
+            total_seen += len(chunk)
+
+            if len(benign_chunk):
+                benign_rows.extend(benign_chunk.to_dict("records"))
+                if len(benign_rows) > keep_cap:
+                    benign_rows = list(pd.DataFrame(benign_rows)
+                                        .sample(n=keep_cap, random_state=rng.randint(0, 2**31 - 1))
+                                        .to_dict("records"))
+            if len(attack_chunk):
+                attack_rows.extend(attack_chunk.to_dict("records"))
+                if len(attack_rows) > keep_cap:
+                    attack_rows = list(pd.DataFrame(attack_rows)
+                                        .sample(n=keep_cap, random_state=rng.randint(0, 2**31 - 1))
+                                        .to_dict("records"))
     except Exception as e:
         print(f"[CIC] Failed to read CSV: {e}")
         return []
 
-    print(f"[CIC] Loaded {len(df)} rows, {len(df.columns)} columns")
+    print(f"[CIC] Scanned {total_seen} total rows across the file — "
+          f"{len(benign_rows)} benign / {len(attack_rows)} attack retained "
+          f"pre-final-sample")
 
-    # Normalise column names (strip whitespace)
-    df.columns = [c.strip() for c in df.columns]
+    # Final downsample to the actual target size
+    n_benign = min(len(benign_rows), target_per_class) if balance else len(benign_rows)
+    n_attack = min(len(attack_rows), target_per_class) if balance else len(attack_rows)
 
-    # Check required columns exist
-    label_col = None
-    for possible in ["Label", "label", " Label"]:
-        if possible.strip() in df.columns:
-            label_col = possible.strip()
-            break
+    if len(benign_rows) > n_benign:
+        benign_rows = list(pd.DataFrame(benign_rows).sample(n=n_benign, random_state=seed).to_dict("records"))
+    if len(attack_rows) > n_attack:
+        attack_rows = list(pd.DataFrame(attack_rows).sample(n=n_attack, random_state=seed).to_dict("records"))
 
-    if label_col is None:
-        print(f"[CIC] Warning: No Label column found. Columns: {list(df.columns[:10])}")
-        df["Label"] = "BENIGN"
-        label_col = "Label"
+    all_rows = benign_rows + attack_rows
+    # Sort back into chronological order (do NOT shuffle here). These rows
+    # become a contiguous "segment" in features.json that world_model.py
+    # builds sliding 5-flow windows from — if the rows are in random order,
+    # each window is 5 unrelated flows glued together, not a real
+    # progression, which gives the LSTM nothing genuine to learn from.
+    # world_model.py's own DataLoader(shuffle=True) already randomises
+    # BATCH order during training — that's the right place for randomness,
+    # not here.
+    try:
+        all_rows.sort(key=lambda r: pd.to_datetime(r.get("Timestamp", ""), dayfirst=True, errors="coerce"))
+    except Exception:
+        pass  # if Timestamp parsing fails entirely, fall back to scan order (still not random)
+    if not balance and len(all_rows) > max_rows:
+        all_rows = all_rows[:max_rows]
 
-    # Balance: equal attack and benign samples
-    if balance:
-        benign  = df[df[label_col].str.upper() == "BENIGN"]
-        attacks = df[df[label_col].str.upper() != "BENIGN"]
-        n = min(len(benign), len(attacks), max_rows // 2)
-        if n > 0:
-            df = pd.concat([
-                benign.sample(n=n, random_state=42),
-                attacks.sample(n=min(n, len(attacks)), random_state=42)
-            ]).sample(frac=1, random_state=42).reset_index(drop=True)
-        print(f"[CIC] Balanced: {len(df)} rows ({n} benign + {min(n,len(attacks))} attack)")
-
-    df = df.head(max_rows)
-
-    # Replace inf values
-    df = df.replace([float("inf"), float("-inf")], 0)
-    df = df.fillna(0)
+    print(f"[CIC] Final sample: {len(all_rows)} rows "
+          f"({len(benign_rows)} benign + {len(attack_rows)} attack)")
 
     # Convert to feature vectors
     features = []
     label_counts = Counter()
 
-    for _, row in df.iterrows():
+    for row in all_rows:
         try:
-            fv = _row_to_feature_vector(row, label_col)
+            fv = _row_to_feature_vector(row, label_col, day_label=day_label, rng=rng)
             if fv:
                 features.append(fv)
                 label_counts[fv["mitre_technique"]] += 1
@@ -310,7 +437,7 @@ def load_cic_csv(csv_path: str,
     return features
 
 
-def _row_to_feature_vector(row, label_col: str) -> dict | None:
+def _row_to_feature_vector(row, label_col: str, day_label: str = "unknown", rng=None) -> dict | None:
     """Convert one CIC-IDS-2018 CSV row to a CyberSentinel feature vector."""
 
     def safe(col, default=0.0):
@@ -338,12 +465,10 @@ def _row_to_feature_vector(row, label_col: str) -> dict | None:
     if mitre is None:
         mitre = "BENIGN"
 
-    # Skip if not useful for our techniques
-    # Focus on T1110 (brute force) which honeypot data lacks
-    # Keep all attacks + 30% of benign for balance
-    import random
-    if mitre == "BENIGN" and random.random() > 0.3:
-        return None
+    # NOTE: benign/attack balancing now happens upstream in load_cic_csv
+    # (a proper stratified sample across the whole file), so this function
+    # no longer does its own probabilistic benign-dropping — doing both
+    # would double-filter and skew the balance load_cic_csv already set up.
 
     # Flow counters
     pkts_fwd  = safe_int("Tot Fwd Pkts")
@@ -441,12 +566,29 @@ def _row_to_feature_vector(row, label_col: str) -> dict | None:
         "port_scan_score":      0.0,
         "unique_dst_ports":     1,
 
-        # Labels
+        # Labels.
+        # is_compromise / infiltration_label answer "is this attack traffic
+        # at all" — TRUE for every recognised attack label (brute force,
+        # DoS, SQLi, ...), not just the 10-class COMPROMISE_TECHNIQUES set.
+        # That set is a SEPARATE, narrower thing: which of the 10 late-stage
+        # techniques the technique-classification head predicts (world_model
+        # .py's make_sequences() already excludes anything outside it from
+        # that head's loss via ignore_index — it does not need is_compromise
+        # to also be restricted to it). Reusing COMPROMISE_TECHNIQUES for
+        # both used to mislabel every CIC brute-force row (T1110, not in the
+        # 10-class set) as infiltration_label=0 — i.e. "not an attack" —
+        # which is wrong and was quietly corrupting the binary-detection
+        # ground truth for every merged CIC-IDS-2018 attack row.
         "mitre_technique":      mitre,
         "cic_label":            cic_label,
-        "is_compromise":        int(mitre in COMPROMISE_TECHNIQUES),
-        "infiltration_label":   int(mitre in COMPROMISE_TECHNIQUES),
-        "source":               "cic_ids_2018",
+        "is_compromise":        int(mitre != "BENIGN"),
+        "infiltration_label":   int(mitre != "BENIGN"),
+        # Day-qualified source so world_model.py's segment-aware sequence
+        # building and train/test split (see _purged_segment_split) treat
+        # each CIC day as its own contiguous block, same as it already does
+        # for the honeypot's own flows — never silently blending two
+        # unrelated traffic sources into one sliding window.
+        "source":               f"cic_ids_2018:{day_label}",
     }
 
 
@@ -559,8 +701,11 @@ def main():
     parser.add_argument("--day",      default=DEFAULT_FILE,
                         choices=list(CIC_FILES.keys()),
                         help="Which day to download")
-    parser.add_argument("--max-rows", type=int, default=10000,
-                        help="Max rows to load (default: 10000)")
+    parser.add_argument("--max-rows", type=int, default=20000,
+                        help="Target OUTPUT sample size, scanned across the "
+                             "WHOLE file not just its head (default: 20000)")
+    parser.add_argument("--seed",     type=int, default=42,
+                        help="Sampling seed — same seed always gives the same sample")
     parser.add_argument("--merge",    metavar="HONEYPOT_JSON",
                         help="Merge with honeypot features.json")
     parser.add_argument("--out",      default="features.json",
@@ -573,10 +718,15 @@ def main():
         csv_path = download_cic(args.day)
         if not csv_path:
             sys.exit(1)
+        day_label = args.day
     else:
         csv_path = args.csv
+        # If the given --csv path happens to match a known day's filename,
+        # use that day's pretty label; otherwise load_cic_csv derives one
+        # from the filename itself.
+        day_label = next((k for k, v in CIC_FILES.items() if v == os.path.basename(csv_path)), None)
 
-    features = load_cic_csv(csv_path, max_rows=args.max_rows)
+    features = load_cic_csv(csv_path, max_rows=args.max_rows, seed=args.seed, day_label=day_label)
     if not features:
         print("[CIC] No features loaded")
         sys.exit(1)

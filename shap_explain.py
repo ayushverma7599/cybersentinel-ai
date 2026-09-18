@@ -16,6 +16,7 @@ Usage:
 import argparse
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 # ── PyTorch ───────────────────────────────────────────────
@@ -404,6 +405,43 @@ def explain_all_sessions(ttp_path: str = TTP_PATH,
     return results
 
 
+def top_distinct_risk_sessions(results: list[dict], n: int = 5) -> list[dict]:
+    """
+    Pick the top-n highest-risk DISTINCT technique sequences, for display.
+
+    Many real sessions share the exact same technique sequence -- e.g.
+    every connection-only probe that trips the T1499 DoS-flood detector
+    encodes to the identical single-token sequence ["T1499"]. The LSTM is
+    deterministic, so it returns the identical prediction/probability for
+    every one of them. Sorting all results by risk and slicing [:n]
+    (the old behaviour) can surface n different session_ids that are
+    really just one finding repeated n times -- correct output, but it
+    reads as a duplication bug in a "Top N riskiest sessions" table and
+    tells the viewer nothing new after the first row.
+
+    This groups by sequence first, keeps the single highest-probability
+    session per distinct sequence, and tags it with how many real sessions
+    shared that pattern -- so "Top 5" means 5 distinct risk findings, each
+    honestly labeled with its true prevalence, instead of 5 rows that
+    happen to look identical.
+    """
+    best_by_seq: dict[tuple, dict] = {}
+    for r in results:
+        key = tuple(r["sequence"])
+        if key not in best_by_seq or r["infiltration_prob"] > best_by_seq[key]["infiltration_prob"]:
+            best_by_seq[key] = r
+
+    counts = Counter(tuple(r["sequence"]) for r in results)
+
+    ranked = sorted(best_by_seq.values(), key=lambda x: -x["infiltration_prob"])
+    top = []
+    for r in ranked[:n]:
+        r = dict(r)
+        r["session_count"] = counts[tuple(r["sequence"])]
+        top.append(r)
+    return top
+
+
 # ─────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────
@@ -441,16 +479,25 @@ def main():
         print(f"\n[SHAP] Explaining all sessions in {args.ttp} (method={args.method})...")
         results = explain_all_sessions(args.ttp, method=args.method)
         print(f"[SHAP] Explained {len(results)} sessions\n")
-        print("  Top 5 highest-risk sessions:")
-        print(f"  {'Session':14s}  {'Sequence':30s}  {'Pred':8s}  {'P(comp)':8s}  Risk")
-        print("  " + "-" * 72)
-        for r in results[:5]:
+        top5 = top_distinct_risk_sessions(results, n=5)
+        n_distinct = len({tuple(r["sequence"]) for r in results})
+        print(f"  Top {len(top5)} highest-risk DISTINCT sequences "
+              f"({n_distinct} distinct sequence(s) across {len(results)} sessions):")
+        print(f"  {'Session':14s}  {'Sequence':30s}  {'Pred':8s}  {'P(comp)':8s}  {'Count':6s}  Risk")
+        print("  " + "-" * 80)
+        for r in top5:
             sid   = r["session_id"][:12]
             seq   = " → ".join(r["sequence"])[:28]
             pred  = r["predicted_next"]
             prob  = f"{r['infiltration_prob']:.0%}"
             risk  = r["risk_label"]
-            print(f"  {sid:14s}  {seq:30s}  {pred:8s}  {prob:8s}  {risk}")
+            count = f"x{r['session_count']}"
+            print(f"  {sid:14s}  {seq:30s}  {pred:8s}  {prob:8s}  {count:6s}  {risk}")
+        if n_distinct == 1 and len(results) > 1:
+            print(f"\n  Note: all {len(results)} sessions collapse to the same technique "
+                  f"sequence, so the model's single deterministic prediction is repeated "
+                  f"{len(results)}x -- that's expected, not a diversity bug. Run "
+                  f"realistic_attack_sim.sh / run_campaign.sh for more varied sequences.")
 
         if args.save:
             out = "shap_all_sessions.json"

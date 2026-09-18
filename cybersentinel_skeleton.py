@@ -30,6 +30,16 @@ OLLAMA_TIMEOUT = 120          # seconds per agent call — increased for queued 
 NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 NVD_TIMEOUT = 10
 
+# SIH26153 requires the working demo interface to "run fully offline without
+# cloud API dependencies." The NVD lookup below is the one piece of this
+# pipeline that needs real internet access. cve_cache.json — pre-populated
+# once by running `python3 prefetch_cve_cache.py` while online — removes
+# that dependency at demo time: every technique keyword the CVE-match agent
+# can ever look up (see TECHNIQUE_NVD_KEYWORDS below) gets fetched and
+# cached in advance, so a live demo run never needs a network call to show
+# real CVE data, even fully air-gapped.
+CVE_CACHE_PATH = "cve_cache.json"
+
 # Semaphore: max 2 concurrent Ollama calls at any time.
 # Mistral 7B processes ~1 request at a time — flooding it causes timeouts.
 # With semaphore=2: requests queue locally, none time out.
@@ -127,6 +137,11 @@ TECHNIQUE_REGISTRY = {
         "check": "Is who/w output suppressed? Are logged-in users visible to unprivileged sessions?",
         "criticality": 0.45,
     },
+    "T1046": {
+        "name": "Network Service Scanning",
+        "check": "Is port scanning detected and blocked? Are internal services firewalled? Is an IDS monitoring for scan signatures (sequential/randomised port access)?",
+        "criticality": 0.65,
+    },
     # ── Execution ────────────────────────────────────────────────────
     "T1059": {
         "name": "Command and Scripting Interpreter",
@@ -174,6 +189,17 @@ TECHNIQUE_REGISTRY = {
         "name": "Exfiltration Over Alternative Protocol",
         "check": "Is outbound SCP/SFTP/FTP to unknown hosts blocked?",
         "criticality": 0.80,
+    },
+    # ── Collection / Exfiltration (attack1.sh Phase 13) ──────────────
+    "T1005": {
+        "name": "Data from Local System",
+        "check": "Are sensitive files (SSH keys, /etc/passwd, configs) readable and archivable by a compromised low-priv session? Is file-access auditing (e.g. auditd watch rules) in place?",
+        "criticality": 0.80,
+    },
+    "T1041": {
+        "name": "Exfiltration Over C2 Channel",
+        "check": "Is outbound POST/upload traffic to unrecognized hosts blocked or DLP-inspected? Is egress filtering enforced on the compromised host's network segment?",
+        "criticality": 0.85,
     },
     # ── Persistence ──────────────────────────────────────────────────
     "T1136": {
@@ -241,6 +267,11 @@ TECHNIQUE_REGISTRY = {
         "check": "Are systemctl/service commands restricted to root? Is service manipulation audited?",
         "criticality": 0.90,
     },
+    "T1499": {
+        "name": "Endpoint Denial of Service",
+        "check": "Is connection rate limiting enabled? Are SYN flood protections (SYN cookies) active? Is per-IP connection capping configured?",
+        "criticality": 0.75,
+    },
     "T1485": {
         "name": "Data Destruction",
         "check": "Are rm -rf patterns on critical paths blocked? Is filesystem integrity monitored?",
@@ -297,12 +328,49 @@ def ollama_call(prompt: str, system: str = "", max_tokens: int = 512) -> str:
 # NVD CVE LOOKUP HELPER
 # ─────────────────────────────────────────────
 
-def nvd_cve_lookup(keyword: str, max_results: int = 3) -> list[dict]:
+_cve_cache = None   # lazy-loaded module-level dict: {keyword: [cve_dict, ...]}
+
+
+def _load_cve_cache() -> dict:
+    global _cve_cache
+    if _cve_cache is None:
+        try:
+            with open(CVE_CACHE_PATH) as f:
+                _cve_cache = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            _cve_cache = {}
+    return _cve_cache
+
+
+def _save_cve_cache() -> None:
+    if _cve_cache is not None:
+        try:
+            with open(CVE_CACHE_PATH, "w") as f:
+                json.dump(_cve_cache, f, indent=2)
+        except Exception:
+            pass   # cache is a convenience, never let a write failure break a lookup
+
+
+def nvd_cve_lookup(keyword: str, max_results: int = 3, use_cache: bool = True) -> list[dict]:
     """
     Query NVD public API for CVEs matching a keyword (e.g. 'OpenSSH 7.4').
     Returns list of {id, description, cvss_score, published}.
-    Falls back to empty list on network failure (offline-safe).
+
+    Checks cve_cache.json first (see CVE_CACHE_PATH above) — a cache hit,
+    including a legitimately empty result ("NVD has no CVEs for this
+    keyword"), returns immediately with no network call. A cache miss falls
+    through to the live NVD call and, on success, is written back to the
+    cache. A network failure still returns [] (offline-safe) but is NOT
+    cached, so a later run with internet access can fill it in.
+
+    Run `prefetch_cve_cache.py` once while online to pre-populate every
+    keyword the CVE-match agent can look up, so the demo interface never
+    needs live internet at presentation time.
     """
+    cache = _load_cve_cache() if use_cache else {}
+    if use_cache and keyword in cache:
+        return cache[keyword]
+
     try:
         url = f"{NVD_API_URL}?keywordSearch={urllib.parse.quote(keyword)}&resultsPerPage={max_results}"
         req = urllib.request.Request(url, headers={"User-Agent": "CyberSentinel-AI/1.0"})
@@ -339,9 +407,12 @@ def nvd_cve_lookup(keyword: str, max_results: int = 3) -> list[dict]:
                     "cvss_score": cvss_score,
                     "published": published,
                 })
+            if use_cache:
+                cache[keyword] = results
+                _save_cve_cache()
             return results
     except Exception:
-        return []   # graceful offline fallback
+        return []   # graceful offline fallback — not cached, retry-able later
 
 
 # urllib.parse needed for nvd_cve_lookup
@@ -556,6 +627,8 @@ TECHNIQUE_NVD_KEYWORDS = {
     "T1016":     "network configuration disclosure ifconfig",
     "T1049":     "network connection listing netstat",
     "T1033":     "user discovery Linux who",
+    "T1046":     "network service scanning nmap port scan detection",
+    "T1552":     "unsecured credentials private key exposure Linux",
     "T1059":     "bash shell command injection",
     "T1059.004": "unix shell injection bash",
     "T1059.006": "python code execution exploit",
@@ -565,6 +638,8 @@ TECHNIQUE_NVD_KEYWORDS = {
     "T1105":     "wget curl remote file download malware",
     "T1071":     "HTTP covert channel command control",
     "T1048":     "data exfiltration SSH SCP FTP",
+    "T1005":     "local file collection sensitive data disclosure Linux",
+    "T1041":     "data exfiltration HTTP POST C2 channel",
     "T1136":     "Linux user account creation exploit",
     "T1098":     "SSH authorized_keys manipulation",
     "T1053.003": "cron privilege escalation Linux",
@@ -577,6 +652,7 @@ TECHNIQUE_NVD_KEYWORDS = {
     "T1204":     "arbitrary code execution user privilege Linux",
     "T1204.002": "malicious executable download Linux noexec",
     "T1489":     "service stop Linux systemctl exploit",
+    "T1499":     "denial of service SYN flood connection exhaustion Linux",
     "T1485":     "data destruction Linux filesystem wipe",
     "T1496":     "cryptomining malware Linux CPU hijack",
 }
@@ -811,10 +887,21 @@ def generate_report(findings: list[dict], output_path: str = "cybersentinel_repo
         print(f"       Sessions:     {f['source_sessions']}")
         print(f"       Check:        {f['check_question']}")
         if f["config_analysis"]:
-            # Print first 2 lines of config analysis
+            # Print first 2 lines of config analysis. This is raw LLM
+            # output, so every line used to get printed under a hardcoded
+            # "Fix:" label even when it was actually stating the
+            # misconfiguration or a verification step, not a fix. Label
+            # each line by what it actually says instead.
             lines = [l.strip() for l in f["config_analysis"].splitlines() if l.strip()][:2]
             for line in lines:
-                print(f"       Fix:          {line}")
+                lower = line.lower()
+                if "verif" in lower[:24]:
+                    label = "Verify:"
+                elif "misconfig" in lower[:24] or lower.startswith("1."):
+                    label = "Finding:"
+                else:
+                    label = "Fix:"
+                print(f"       {label:<14}{line}")
         print()
 
     print(f"  Full report saved to: {output_path}")

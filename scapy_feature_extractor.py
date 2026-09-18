@@ -28,7 +28,7 @@ WORKFLOW (two steps, because sniffing needs root and a live capture window):
   needs sudo since packet capture requires elevated privileges):
 
     sudo python3 scapy_feature_extractor.py --capture \\
-        --iface docker0 --port 2222 --out honeypot_capture.pcap
+        --iface docker0 --port 2222 --pcap honeypot_capture.pcap
     # (in another terminal) ./attack.sh
     # Ctrl+C the capture once attack.sh finishes
 
@@ -55,7 +55,7 @@ from collections import defaultdict
 
 def _require_scapy():
     try:
-        from scapy.all import sniff, wrpcap, rdpcap, IP, TCP  # noqa: F401
+        from scapy.all import AsyncSniffer, sniff, wrpcap, rdpcap, IP, TCP  # noqa: F401
     except ImportError:
         print("[!] scapy required: pip install scapy --break-system-packages")
         sys.exit(1)
@@ -63,16 +63,51 @@ def _require_scapy():
 
 def capture_traffic(iface: str, port: int, out_path: str):
     """Live-sniff real packets to/from the given port and save to a pcap.
-    Requires root. Run this WHILE attack.sh is running in another terminal.
+    Requires root. Run this WHILE attack.sh is running in another terminal
+    (or let attack1.sh drive it automatically in the background).
+
+    Why AsyncSniffer + explicit signal handlers instead of a plain
+    sniff() call: plain sniff() blocks inside a single C-level capture
+    loop, and relies on the OS delivering SIGINT/SIGTERM at a point where
+    the Python interpreter happens to check for pending signals — which
+    in practice was NOT happening reliably here. Confirmed directly: when
+    attack1.sh sent SIGINT (via kill -INT and even via `pkill -f` matching
+    the process by its full command line), the sniffing process stayed
+    alive and never wrote its pcap, sitting there as an orphan minutes
+    after the attack run finished. AsyncSniffer runs the actual capture on
+    a background thread with its own short internal poll interval, so
+    .stop() returns promptly regardless of how much traffic has arrived.
+    Combining that with our own signal.signal() handlers here means
+    "stop capturing" is a plain Python flag check, not a race against
+    libpcap internals or however many sudo processes the signal had to
+    pass through to get here.
     """
     _require_scapy()
-    from scapy.all import sniff, wrpcap
+    from scapy.all import AsyncSniffer, wrpcap
+    import signal as _signal
+    import time as _time
 
     print(f"[*] Sniffing on {iface}, filter: tcp port {port}")
-    print(f"[*] Run ./attack.sh in another terminal now. Ctrl+C here when it finishes.")
-    packets = sniff(iface=iface, filter=f"tcp port {port}")
-    wrpcap(out_path, packets)
-    print(f"[+] Captured {len(packets)} real packets to {out_path}")
+    print(f"[*] Run ./attack.sh in another terminal now. Ctrl+C here (or send SIGINT/SIGTERM to this process) when it finishes.")
+
+    sniffer = AsyncSniffer(iface=iface, filter=f"tcp port {port}", store=True)
+    sniffer.start()
+
+    stop_requested = {"flag": False}
+
+    def _handle_stop(signum, frame):
+        stop_requested["flag"] = True
+
+    _signal.signal(_signal.SIGINT, _handle_stop)
+    _signal.signal(_signal.SIGTERM, _handle_stop)
+
+    try:
+        while not stop_requested["flag"]:
+            _time.sleep(0.25)
+    finally:
+        packets = sniffer.stop()
+        wrpcap(out_path, packets)
+        print(f"[+] Captured {len(packets)} real packets to {out_path}")
 
 
 def _mean(vals):
@@ -86,7 +121,7 @@ def _variance(vals):
     return sum((v - m) ** 2 for v in vals) / len(vals)
 
 
-def extract_features(pcap_path: str) -> dict:
+def extract_features(pcap_path: str, honeypot_port: int = 2222) -> dict:
     """
     Parse a real pcap and compute genuine per-flow packet-level features,
     matching SIH26153's explicit list:
@@ -96,6 +131,11 @@ def extract_features(pcap_path: str) -> dict:
       - payload size distribution
       - port scan signatures (distinct dst ports touched by one src)
       - retransmission counts
+
+    honeypot_port identifies which side of each packet is the honeypot
+    (Cowrie), so both directions of one real TCP connection collapse into
+    ONE flow keyed by the attacker's real ephemeral port — see the
+    canonicalization note below.
     """
     _require_scapy()
     from scapy.all import rdpcap, IP, TCP
@@ -103,7 +143,17 @@ def extract_features(pcap_path: str) -> dict:
     packets = rdpcap(pcap_path)
     print(f"[+] Loaded {len(packets)} real packets from {pcap_path}")
 
-    # Group by 5-tuple flow: (src_ip, dst_ip, src_port, dst_port, proto)
+    # Group by a CANONICAL, direction-independent flow key. A raw
+    # (src_ip, dst_ip, src_port, dst_port) key is directional: every real
+    # TCP connection carries packets in both directions (attacker->honeypot
+    # AND honeypot->attacker), so a raw key silently split each connection
+    # into two unrelated "flows" — one correctly keyed by the attacker's
+    # real ephemeral src_port (matchable against Cowrie's session records),
+    # and one bogus flow keyed by src_port=honeypot_port (Cowrie's own
+    # listening port), which can never match anything and roughly halved
+    # the usable flow count. Canonicalize on whichever side ISN'T the
+    # honeypot's listening port, and pool packets from both directions of
+    # that connection into one flow.
     flows = defaultdict(lambda: {
         "ttl_values": [],
         "window_sizes": [],
@@ -121,7 +171,20 @@ def extract_features(pcap_path: str) -> dict:
             continue
         ip_layer = pkt[IP]
         tcp_layer = pkt[TCP]
-        flow_key = (ip_layer.src, ip_layer.dst, tcp_layer.sport, tcp_layer.dport, "TCP")
+
+        # Canonicalize: whichever side is NOT honeypot_port is "the client"
+        # for this flow's identity, regardless of which direction this
+        # particular packet is travelling.
+        if tcp_layer.sport == honeypot_port and tcp_layer.dport != honeypot_port:
+            client_ip, client_port = ip_layer.dst, tcp_layer.dport
+            hp_ip, hp_port = ip_layer.src, tcp_layer.sport
+        else:
+            client_ip, client_port = ip_layer.src, tcp_layer.sport
+            hp_ip, hp_port = ip_layer.dst, tcp_layer.dport
+        # Same field order as the old key (src_ip, dst_ip, sport, dport,
+        # proto) so the results-building loop below is unchanged — "src"
+        # now always canonically means "the client/attacker side".
+        flow_key = (client_ip, hp_ip, client_port, hp_port, "TCP")
         f = flows[flow_key]
 
         f["packet_count"] += 1
@@ -144,10 +207,40 @@ def extract_features(pcap_path: str) -> dict:
 
         dst_ports_by_src_ip[ip_layer.src].add(tcp_layer.dport)
 
+    # Connection-frequency signal, computed per client IP across ALL flows in
+    # this capture. This is NOT the same thing as "distinct destination
+    # ports touched" (below) — that signal is structurally stuck at 1 for
+    # every flow here, because the capture itself is filtered to a single
+    # port ("tcp port {honeypot_port}" in capture_traffic()), so no client
+    # can ever be observed touching more than one port regardless of its
+    # actual behavior. A real port-scan-of-the-honeypot signal would need a
+    # wider, unfiltered capture AND an attacker that actually probes other
+    # ports at the packet level — neither is true of this project's attack
+    # simulation (its Phase 5 "scan" runs application-layer, inside an
+    # already-established Cowrie shell session, so it never appears here as
+    # real packets at all). What IS genuinely measurable from this capture,
+    # and genuinely distinguishes normal traffic from suspicious traffic, is
+    # connection velocity: how many separate flows the same client IP opened
+    # during the capture window. A single legitimate SSH session opens one;
+    # Phase 10's DoS flood opens fifty from one IP in seconds. That's a real
+    # signal, so port_scan_score is built from it rather than left at a
+    # permanently dead 0 or faked from data the capture can't see.
+    flows_by_client_ip = defaultdict(int)
+    for flow_key in flows:
+        flows_by_client_ip[flow_key[0]] += 1
+
     results = {}
     for flow_key, f in flows.items():
         src_ip, dst_ip, sport, dport, proto = flow_key
         key_str = f"{src_ip}:{sport}->{dst_ip}:{dport}"
+        ttl_std = round(_variance(f["ttl_values"]) ** 0.5, 4)
+        payload_size_std = round(_variance(f["payload_sizes"]) ** 0.5, 2)
+        distinct_dst_ports = len(dst_ports_by_src_ip[src_ip])
+        # Saturates at 20 connections from one IP within this capture — a
+        # deliberately simple, documented threshold (not a calibrated
+        # model), chosen so a single session scores 0 and Phase 10's 50-way
+        # flood scores at/near the 1.0 ceiling.
+        conn_freq_score = round(min(1.0, max(0, flows_by_client_ip[src_ip] - 1) / 19), 4)
         results[key_str] = {
             "src_ip": src_ip,
             "dst_ip": dst_ip,
@@ -157,14 +250,21 @@ def extract_features(pcap_path: str) -> dict:
             # Real measured values, not constants:
             "ttl_mean": round(_mean(f["ttl_values"]), 2),
             "ttl_variance": round(_variance(f["ttl_values"]), 4),
+            "ttl_std": ttl_std,                        # = world_model.py's FEATURE_COLS name
             "tcp_window_mean": round(_mean(f["window_sizes"]), 2),
             "ip_fragment_count": f["fragment_count"],
             "payload_size_mean": round(_mean(f["payload_sizes"]), 2),
             "payload_size_max": max(f["payload_sizes"]) if f["payload_sizes"] else 0,
+            "payload_size_std": payload_size_std,       # = world_model.py's FEATURE_COLS name
             "retransmission_count": f["retransmissions"],
             # Port scan signature: how many distinct dst ports this src IP touched
-            # across the WHOLE capture, not just this one flow.
-            "distinct_dst_ports_from_src": len(dst_ports_by_src_ip[src_ip]),
+            # across the WHOLE capture, not just this one flow. See the note
+            # above the flows_by_client_ip block — structurally ~1 given this
+            # capture's single-port filter, kept for transparency rather than
+            # hidden, and NOT what port_scan_score is derived from.
+            "distinct_dst_ports_from_src": distinct_dst_ports,
+            "unique_dst_ports": distinct_dst_ports,     # = world_model.py's FEATURE_COLS name
+            "port_scan_score": conn_freq_score,         # connection-frequency signal, see above
         }
 
     return results
@@ -218,12 +318,16 @@ def merge_packet_features(packet_features_path: str, features_json_path: str, ou
             row.update({
                 "ttl_mean": pkt["ttl_mean"],
                 "ttl_variance": pkt["ttl_variance"],
+                "ttl_std": pkt["ttl_std"],                       # world_model.py FEATURE_COLS
                 "tcp_window_mean": pkt["tcp_window_mean"],
                 "ip_fragment_count": pkt["ip_fragment_count"],
                 "payload_size_mean": pkt["payload_size_mean"],
                 "payload_size_max": pkt["payload_size_max"],
+                "payload_size_std": pkt["payload_size_std"],     # world_model.py FEATURE_COLS
                 "retransmission_count": pkt["retransmission_count"],
                 "distinct_dst_ports_from_src": pkt["distinct_dst_ports_from_src"],
+                "unique_dst_ports": pkt["unique_dst_ports"],     # world_model.py FEATURE_COLS
+                "port_scan_score": pkt["port_scan_score"],       # world_model.py FEATURE_COLS
                 "packet_features_source": "real_scapy_capture",
             })
             matched += 1
@@ -267,9 +371,19 @@ def main():
     args = parser.parse_args()
 
     if args.capture:
-        capture_traffic(args.iface, args.port, args.out if args.out != "packet_features.json" else "honeypot_capture.pcap")
+        # Capture mode writes a pcap, so its destination is --pcap (the same
+        # flag --extract later reads AS INPUT — "the pcap file this run is
+        # working with"), not --out (which is the JSON output path for
+        # --extract/--merge). The previous logic here keyed off --out with a
+        # fallback hack, silently ignoring whatever --pcap was actually
+        # passed — which is exactly the flag attack1.sh passes ($PCAP_FILE,
+        # a fresh timestamped name each run) to avoid overwriting the same
+        # generic honeypot_capture.pcap on every run. That mismatch is why
+        # captures kept landing in the wrong file no matter what attack1.sh
+        # asked for.
+        capture_traffic(args.iface, args.port, args.pcap)
     elif args.extract:
-        results = extract_features(args.pcap)
+        results = extract_features(args.pcap, honeypot_port=args.port)
         with open(args.out, "w") as f:
             json.dump(results, f, indent=2)
         print(f"[+] {len(results)} real flows extracted, written to {args.out}")

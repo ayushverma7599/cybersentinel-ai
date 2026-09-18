@@ -62,6 +62,51 @@ try:
 except ImportError:
     pass
 
+
+def _normalise_uploaded_flows(raw_flows: list) -> list:
+    """
+    Normalise uploaded flow features (from an uploaded PCAP or CSV) for
+    world-model inference.
+
+    Uses this project's OWN saved training-time min/max params
+    (features_norm_params.json), when they exist, so an uploaded file is
+    scored on the same scale the model was actually trained on. Recomputing
+    a fresh per-upload min/max instead would silently normalise the exact
+    same raw value differently depending only on what else happened to be
+    in that particular upload — not what the SIH26153 demo requirement
+    ("accepting PCAP/CSV input") is asking for. Falls back to a fresh
+    per-batch min/max only if no saved params file exists yet (e.g. the
+    world model has never been trained in this session).
+    """
+    if not raw_flows:
+        return raw_flows
+
+    params = {}
+    params_path = "features_norm_params.json"
+    if os.path.exists(params_path):
+        try:
+            with open(params_path) as f:
+                params = json.load(f)
+        except Exception:
+            params = {}
+
+    if not params:
+        for col in FEATURE_COLS:
+            vals = [float(f.get(col, 0.0)) for f in raw_flows]
+            params[col] = {"min": min(vals), "max": max(vals)}
+
+    for flow in raw_flows:
+        for col in FEATURE_COLS:
+            if f"{col}_norm" in flow:
+                continue  # e.g. an uploaded CSV that already carries normalised columns
+            mn = params.get(col, {}).get("min", 0.0)
+            mx = params.get(col, {}).get("max", 1.0)
+            raw = float(flow.get(col, 0.0))
+            flow[f"{col}_norm"] = round((raw - mn) / (mx - mn), 6) if mx > mn else 0.0
+
+    return raw_flows
+
+
 # ─────────────────────────────────────────────────────────
 # PAGE CONFIG
 # ─────────────────────────────────────────────────────────
@@ -88,19 +133,52 @@ TECHNIQUE_LABELS = {
     "T1136": "Create Account",
     "T1070": "Indicator Removal",
     "T1496": "Resource Hijacking",
+    "T1016": "Network Config Discovery",
+    "T1057": "Process Discovery",
+    "T1021": "Remote Services",
+    "T1046": "Network Service Scanning",
+    "T1190": "Exploit Public-Facing App",
+    "T1071": "Application Layer Protocol",
+    "T1552": "Unsecured Credentials",
+    "T1499": "Endpoint Denial of Service",
+    "T1489": "Service Stop",
+    "T1049": "Network Connections Discovery",
+    "T1033": "System Owner/User Discovery",
+    "T1485": "Data Destruction",
 }
 
 TACTIC_MAP = {
+    # Discovery
     "T1082": "Discovery",
     "T1087": "Discovery",
-    "T1105": "Command & Control",
+    "T1016": "Discovery",
+    "T1057": "Discovery",
+    "T1049": "Discovery",
+    "T1033": "Discovery",
+    "T1046": "Reconnaissance",
+    # Initial Access / Credential Access
+    "T1110": "Credential Access",
+    "T1552": "Credential Access",
+    "T1190": "Initial Access",
+    # Execution
     "T1204": "Execution",
     "T1059": "Execution",
-    "T1110": "Credential Access",
-    "T1548": "Privilege Escalation",
+    # Command & Control
+    "T1105": "Command & Control",
+    "T1071": "Command & Control",
+    # Lateral Movement
+    "T1021": "Lateral Movement",
+    # Persistence
     "T1136": "Persistence",
+    # Privilege Escalation
+    "T1548": "Privilege Escalation",
+    # Defense Evasion
     "T1070": "Defense Evasion",
+    # Impact
     "T1496": "Impact",
+    "T1499": "Impact",
+    "T1489": "Impact",
+    "T1485": "Impact",
 }
 
 RISK_COLORS = {
@@ -113,9 +191,6 @@ RISK_COLORS = {
 
 def tlabel(tid):
     return TECHNIQUE_LABELS.get(tid, tid)
-
-def ttactic(tid):
-    return TACTIC_MAP.get(tid, "Unknown")
 
 def risk_color(label):
     return RISK_COLORS.get(label, "#94a3b8")
@@ -575,27 +650,51 @@ elif page == "📈 K-Step Forecast":
 
             # Full chain display
             st.subheader("Predicted Kill Chain")
+
+            # ATT&CK kill chain phase order for display
+            PHASE_ICONS = {
+                "Reconnaissance":     "🔍",
+                "Initial Access":     "🚪",
+                "Credential Access":  "🔑",
+                "Discovery":          "🗺️",
+                "Execution":          "⚡",
+                "Command & Control":  "📡",
+                "Lateral Movement":   "↔️",
+                "Persistence":        "🔒",
+                "Privilege Escalation":"⬆️",
+                "Defense Evasion":    "🥷",
+                "Collection":         "📦",
+                "Exfiltration":       "📤",
+                "Impact":             "💥",
+            }
+
             chain_cols = st.columns(min(len(chain) * 2 - 1, 11))
             for i, t in enumerate(chain):
                 col_idx = i * 2
                 if col_idx >= len(chain_cols):
                     break
                 is_observed = i < len(sequence)
+                tactic = TACTIC_MAP.get(t, "Unknown")
+                phase_icon = PHASE_ICONS.get(tactic, "🔹")
                 bg = "#1e40af" if is_observed else ("#ef4444" if t in COMPROMISE_TECHNIQUES else "#7c3aed")
                 with chain_cols[col_idx]:
                     badge = "OBSERVED" if is_observed else "PREDICTED"
                     st.markdown(
                         f'<div style="background:{bg};color:white;padding:8px;'
                         f'border-radius:8px;text-align:center;font-size:11px;font-weight:600">'
-                        f'{t}<br>{tlabel(t)}'
-                        f'<br><span style="opacity:0.9;font-size:10px;font-style:italic">{ttactic(t)}</span>'
-                        f'<br><span style="opacity:0.8;font-size:10px">{badge}</span></div>',
+                        f'{phase_icon} {tactic}<br>'
+                        f'<span style="font-size:12px;font-weight:700">{t}</span><br>'
+                        f'<span style="opacity:0.85;font-size:10px">{tlabel(t)}</span><br>'
+                        f'<span style="opacity:0.7;font-size:9px;background:rgba(0,0,0,0.2);'
+                        f'padding:1px 5px;border-radius:4px">{badge}</span></div>',
                         unsafe_allow_html=True
                     )
                 if i < len(chain) - 1 and col_idx + 1 < len(chain_cols):
                     with chain_cols[col_idx + 1]:
-                        st.markdown('<div style="text-align:center;font-size:18px;padding-top:6px">→</div>',
-                                    unsafe_allow_html=True)
+                        st.markdown(
+                            '<div style="text-align:center;font-size:18px;padding-top:12px">→</div>',
+                            unsafe_allow_html=True
+                        )
 
             st.markdown("---")
 
@@ -607,8 +706,8 @@ elif page == "📈 K-Step Forecast":
                       "confidence": 1.0}] +
                     steps
                 )
-                step_labels = ["Start"] + [
-                    f"Step {s['step']}: {s['predicted_technique']} ({ttactic(s['predicted_technique'])})"
+                step_labels = ["Start (Observed)"] + [
+                    f"Step {s['step']}: {s['predicted_technique']}\n{TACTIC_MAP.get(s['predicted_technique'], '')}"
                     for s in steps
                 ]
                 probs = [0.3] + [s["infiltration_prob"] for s in steps]
@@ -644,16 +743,31 @@ elif page == "📈 K-Step Forecast":
 
                 # Step table
                 st.subheader("Step Detail")
+                # Header
+                h1, h2, h3, h4 = st.columns([0.5, 1.5, 1.5, 2])
+                with h1: st.caption("**Step**")
+                with h2: st.caption("**Technique**")
+                with h3: st.caption("**ATT&CK Tactic Phase**")
+                with h4: st.caption("**Infiltration Probability**")
+                st.divider()
+
                 for s in steps:
-                    col1, col2, col3 = st.columns([1, 2, 2])
+                    tid    = s["predicted_technique"]
+                    tactic = TACTIC_MAP.get(tid, "Unknown")
+                    phase_icon = PHASE_ICONS.get(tactic, "🔹")
+                    comp   = "🔴" if tid in COMPROMISE_TECHNIQUES else "🔵"
+                    col1, col2, col3, col4 = st.columns([0.5, 1.5, 1.5, 2])
                     with col1:
-                        st.markdown(f"**Step {s['step']}**")
+                        st.markdown(f"**{s['step']}**")
                     with col2:
-                        comp = "🔴" if s["predicted_technique"] in COMPROMISE_TECHNIQUES else "🔵"
-                        st.markdown(f"{comp} `{s['predicted_technique']}` — {tlabel(s['predicted_technique'])}")
+                        st.markdown(f"{comp} `{tid}`  \n{tlabel(tid)}")
                     with col3:
-                        st.progress(s["infiltration_prob"],
-                                    text=f"P(compromise)={s['infiltration_prob']:.0%}  conf={s['confidence']:.0%}")
+                        st.markdown(f"{phase_icon} **{tactic}**")
+                    with col4:
+                        st.progress(
+                            s["infiltration_prob"],
+                            text=f"P(compromise)={s['infiltration_prob']:.0%}  conf={s['confidence']:.0%}"
+                        )
 
 
 # ─────────────────────────────────────────────────────────
@@ -791,23 +905,183 @@ elif page == "🌐 World Model":
 
     st.markdown("---")
 
+    # ── Live PCAP/CSV upload — offline demo interface ──────
+    # SIH26153 requires: "an offline demo interface accepting PCAP/CSV input"
+    # This runs real inference on traffic the model has never seen, instead
+    # of only replaying the precomputed features_all.json below.
+    st.subheader("📤 Upload PCAP / CSV for Live Inference")
+    st.markdown(
+        "Upload a **PCAP** file (parsed the same way as `packet_capture.py --capture`, "
+        "via Scapy) or a **CSV** of already-extracted flow features (same schema as this "
+        "project's own `features.csv` — the 30 columns in `FEATURE_COLS`) to run the trained "
+        "world model on traffic outside the training set."
+    )
+
+    if not WORLD_MODEL_AVAILABLE:
+        st.warning("world_model.py not available — cannot run inference on an upload.")
+    else:
+        uploaded = st.file_uploader(
+            "Choose a .pcap/.cap or .csv file",
+            type=["pcap", "cap", "csv"],
+            key="world_model_upload",
+        )
+
+        if uploaded is not None:
+            suffix = Path(uploaded.name).suffix.lower()
+            tmp_path = os.path.join("/tmp", f"cybersentinel_upload{suffix}")
+            with open(tmp_path, "wb") as f:
+                f.write(uploaded.getbuffer())
+
+            upload_flows, upload_error = None, None
+
+            if suffix in (".pcap", ".cap"):
+                try:
+                    from packet_capture import parse_pcap
+                    raw_flows = parse_pcap(tmp_path)
+                    if not raw_flows:
+                        upload_error = (
+                            "No TCP/UDP flows could be extracted from this PCAP "
+                            "(Scapy may be unavailable on this machine, or the file has no "
+                            "usable packets)."
+                        )
+                    else:
+                        upload_flows = _normalise_uploaded_flows(raw_flows)
+                except Exception as e:
+                    upload_error = f"Failed to parse PCAP: {e}"
+
+            elif suffix == ".csv":
+                try:
+                    import pandas as pd
+                    df = pd.read_csv(tmp_path)
+                    missing = [c for c in FEATURE_COLS
+                               if c not in df.columns and f"{c}_norm" not in df.columns]
+                    if missing:
+                        upload_error = (
+                            f"CSV is missing {len(missing)} expected feature column(s) "
+                            f"(e.g. {missing[:5]}). Upload a CSV with the same schema as this "
+                            f"project's own features.csv, or a PCAP file instead."
+                        )
+                    else:
+                        upload_flows = _normalise_uploaded_flows(df.to_dict("records"))
+                except Exception as e:
+                    upload_error = f"Failed to parse CSV: {e}"
+
+            if upload_error:
+                st.error(upload_error)
+            elif upload_flows is not None:
+                st.success(f"Extracted {len(upload_flows)} flow(s) from {uploaded.name}")
+
+                if len(upload_flows) < SEQ_LEN:
+                    st.warning(
+                        f"Only {len(upload_flows)} flow(s) found — the world model needs at "
+                        f"least {SEQ_LEN} consecutive flows for one prediction window. "
+                        f"Upload a longer capture."
+                    )
+                else:
+                    n_windows = len(upload_flows) - SEQ_LEN + 1
+                    st.caption(f"Running inference on {n_windows} sliding window(s) of "
+                               f"{SEQ_LEN} flows each...")
+
+                    timeline = []
+                    with st.spinner("Running world model on uploaded traffic..."):
+                        for end in range(SEQ_LEN, len(upload_flows) + 1):
+                            window = upload_flows[end - SEQ_LEN:end]
+                            try:
+                                r = predict_from_recent_flows(window, k_steps=1)
+                                if "error" in r:
+                                    continue
+                                timeline.append({
+                                    "window_end_flow":     end - 1,
+                                    "infiltration_prob":   r.get("infiltration_prob", 0.0),
+                                    "risk_label":          r.get("risk_label", "?"),
+                                    "predicted_technique": r.get("predicted_technique"),
+                                    "technique_confidence": r.get("technique_confidence", 0.0),
+                                })
+                            except Exception:
+                                continue
+
+                    if not timeline:
+                        st.warning("Inference did not produce results for this file.")
+                    else:
+                        probs = [t["infiltration_prob"] for t in timeline]
+                        flagged = [t for t in timeline if t["infiltration_prob"] >= 0.65]
+
+                        colA, colB, colC = st.columns(3)
+                        with colA:
+                            st.metric("Windows analysed", len(timeline))
+                        with colB:
+                            st.metric("Peak infiltration prob", f"{max(probs):.1%}")
+                        with colC:
+                            st.metric("Flagged windows (≥65%)", len(flagged))
+
+                        fig_up = go.Figure(go.Scatter(
+                            x=[t["window_end_flow"] for t in timeline],
+                            y=probs,
+                            mode="lines+markers",
+                            line=dict(color="#f59e0b", width=2),
+                            marker=dict(size=6),
+                            fill="tozeroy",
+                            fillcolor="rgba(245,158,11,0.1)",
+                        ))
+                        fig_up.add_hline(y=0.85, line_dash="dash", line_color="#ef4444",
+                                         annotation_text="CRITICAL threshold")
+                        fig_up.add_hline(y=0.65, line_dash="dot", line_color="#f59e0b",
+                                         annotation_text="HIGH threshold")
+                        fig_up.update_layout(
+                            height=300,
+                            xaxis_title="Flow index (window end)",
+                            yaxis=dict(tickformat=".0%", range=[0, 1.05],
+                                       title="P(infiltration)"),
+                            margin=dict(l=10, r=10, t=20, b=10),
+                            paper_bgcolor="rgba(0,0,0,0)",
+                            plot_bgcolor="rgba(0,0,0,0)",
+                        )
+                        st.plotly_chart(fig_up, width="stretch")
+
+                        if flagged:
+                            st.subheader(f"🚩 {len(flagged)} Flagged Window(s)")
+                            st.dataframe(
+                                [{
+                                    "Flow index":          t["window_end_flow"],
+                                    "Infiltration prob":   f"{t['infiltration_prob']:.1%}",
+                                    "Risk":                t["risk_label"],
+                                    "Predicted technique": t["predicted_technique"] or "—",
+                                    "Confidence":          f"{t['technique_confidence']:.1%}",
+                                } for t in flagged],
+                                width="stretch",
+                            )
+                        else:
+                            st.info("No window crossed the HIGH-risk threshold (65%) "
+                                    "in this file.")
+
+    st.markdown("---")
+
     # ── Live world model inference ────────────────────────
     st.subheader("🔮 Live World Model Inference")
-    st.markdown("Load recent flows from features.json and run state-transition prediction.")
+    st.markdown("Load recent flows from features_all.json and run state-transition prediction.")
 
-    features_exist = os.path.exists("features.json")
+    # NOTE: this used to default to features.json — a 401MB file last
+    # regenerated before this session's data-validity fixes (the feature-
+    # circularity dilution via CIC-IDS-2018, the Infilteration label-mapping
+    # bug, the scapy field-name mismatch). world_model.pt is now trained on
+    # features_all.json specifically, so loading the old file here would
+    # silently feed the freshly-fixed model mismatched, stale-distribution
+    # input during a live demo. Pointed at the same corrected file the
+    # model actually trains and benchmarks against.
+    FEATURES_FOR_INFERENCE = "features_all.json"
+    features_exist = os.path.exists(FEATURES_FOR_INFERENCE)
 
     if not features_exist:
         st.warning(
-            "No features.json found. "
-            "Run: `python3 packet_capture.py --cowrie cowrie-raw.json`"
+            f"No {FEATURES_FOR_INFERENCE} found. "
+            "Run: `bash merge_cic_data.sh` (or `python3 cic_ids_loader.py --csv ... --merge ...`)"
         )
     elif not WORLD_MODEL_AVAILABLE:
         st.warning("world_model.py not found in honeypot folder.")
     elif not os.path.exists("world_model.pt"):
         st.warning(
             "No world_model.pt found. "
-            "Run: `python3 world_model.py --train`"
+            f"Run: `python3 world_model.py --train --features {FEATURES_FOR_INFERENCE}`"
         )
     else:
         k_steps = st.slider("K-step forecast:", 1, 5, 3)
@@ -815,9 +1089,25 @@ elif page == "🌐 World Model":
         if st.button("🔮 Run World Model Inference", type="primary"):
             with st.spinner("Loading features and running world model..."):
                 try:
-                    all_features = load_features("features.json")
-                    recent = all_features[-SEQ_LEN:] if len(all_features) >= SEQ_LEN \
-                             else all_features
+                    all_features = load_features(FEATURES_FOR_INFERENCE)
+                    # Prefer the most recent REAL honeypot flows. After a full
+                    # CIC-IDS-2018 merge, the last rows of features_all.json are
+                    # the last-merged CIC day (e.g. an Infiltration day), NOT
+                    # live honeypot traffic — running on those made the "live
+                    # inference" demo silently score a canned CIC row at ~99%.
+                    def _is_honeypot(f):
+                        src = str(f.get("source", "")).lower()
+                        return src.startswith("cowrie") or src.startswith("honeypot") or "proxy" in src
+                    honeypot_rows = [f for f in all_features if _is_honeypot(f)]
+                    if len(honeypot_rows) >= 1:
+                        recent = honeypot_rows[-SEQ_LEN:]
+                        st.caption(f"Inference on the {len(recent)} most recent real honeypot "
+                                   f"flow(s) — of {len(honeypot_rows)} honeypot rows in the dataset.")
+                    else:
+                        recent = all_features[-SEQ_LEN:] if len(all_features) >= SEQ_LEN else all_features
+                        st.warning("No honeypot rows found — falling back to the last rows of the "
+                                   "combined dataset, which are CIC-IDS-2018 data, not live "
+                                   "honeypot traffic.")
                     result = predict_from_recent_flows(recent, k_steps=k_steps)
                 except Exception as e:
                     result = {"error": str(e)}
@@ -825,6 +1115,15 @@ elif page == "🌐 World Model":
             if "error" in result:
                 st.error(f"Inference failed: {result['error']}")
             else:
+                # k_step_forecast() now returns genuine forward-simulation steps —
+                # each a dict {infiltration_prob, predicted_technique, technique_confidence} —
+                # instead of a bare list of floats (the old version only overwrote one
+                # feature slot with the probability; this rolls the model's own predicted
+                # next-state vector forward, and also decodes the technique head that used
+                # to be untrained).
+                forecast_steps = result.get("k_step_forecast", [])
+                forecast_probs = [step["infiltration_prob"] for step in forecast_steps]
+
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.metric("Infiltration Prob",
@@ -832,17 +1131,26 @@ elif page == "🌐 World Model":
                               result["risk_label"])
                 with col2:
                     st.metric("K-Step Forecast",
-                              f"{result['k_step_forecast'][-1]:.1%}",
+                              f"{forecast_probs[-1]:.1%}" if forecast_probs else "n/a",
                               f"after {k_steps} steps")
                 with col3:
                     st.metric("Sequence Length",
                               f"{SEQ_LEN} flows",
                               "temporal context")
 
+                predicted_tech = result.get("predicted_technique")
+                tech_conf = result.get("technique_confidence", 0.0)
+                if predicted_tech:
+                    st.success(f"🎯 Predicted next technique: **{predicted_tech}** "
+                               f"({tech_conf:.1%} confidence)")
+                else:
+                    st.caption(f"No confident next-technique prediction "
+                               f"(top guess only {tech_conf:.1%} confidence)")
+
                 # Forecast line chart
-                if result.get("k_step_forecast"):
-                    steps = ["Current"] + [f"t+{i+1}" for i in range(len(result["k_step_forecast"]))]
-                    probs = [result["infiltration_prob"]] + result["k_step_forecast"]
+                if forecast_probs:
+                    steps = ["Current"] + [f"t+{i+1}" for i in range(len(forecast_probs))]
+                    probs = [result["infiltration_prob"]] + forecast_probs
 
                     fig_fcast = go.Figure(go.Scatter(
                         x=steps, y=probs,
@@ -865,6 +1173,14 @@ elif page == "🌐 World Model":
                         plot_bgcolor="rgba(0,0,0,0)",
                     )
                     st.plotly_chart(fig_fcast, width="stretch")
+
+                    # Per-step predicted technique (from the newly-trained fc_technique head)
+                    step_labels = [s.get("predicted_technique") or "—" for s in forecast_steps]
+                    if any(s.get("predicted_technique") for s in forecast_steps):
+                        st.caption(
+                            "Forecast technique path: " +
+                            " → ".join(step_labels)
+                        )
 
                 # Feature importance
                 if result.get("feature_importance"):

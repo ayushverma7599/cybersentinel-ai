@@ -1,4 +1,3 @@
-version: '2'
 services:
   cowrie:
     image: cowrie/cowrie:latest
@@ -7,6 +6,21 @@ services:
       - "2223:2223"
     volumes:
       - ./cowrie-data:/home/cowrie/cowrie-git/var
+    restart: unless-stopped
+  payload:
+    # Serves attack1.sh's Phase 3 payload (and receives Phase 13's exfil
+    # POST) from a container on the SAME docker-compose network as cowrie,
+    # reachable by the service name "payload" via Docker's built-in DNS.
+    # This replaces guessing/probing host bridge-gateway IPs (172.18.0.1,
+    # 172.17.0.1, ...) from inside the cowrie container, which depends on
+    # host firewall/iptables rules that vary by machine and were the actual
+    # cause of Phase 3 being skipped — container-to-container DNS on a
+    # user-defined bridge network works regardless of host firewall state.
+    image: python:3.12-alpine
+    working_dir: /srv
+    volumes:
+      - ./payload:/srv
+    command: ["python3", "payload_server.py"]
     restart: unless-stopped
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.5.0
